@@ -153,7 +153,7 @@ impl MpduFieldRanges<MpduWithAddressing> {
         #[cfg(feature = "security")]
         return self.next_state(self.offset_aux_sec_hdr.unwrap().get(), None);
         #[cfg(not(feature = "security"))]
-        return self.next_state(self.offset_addressing.get(), None);
+        return self.next_state(self.end_addressing() as u8, None);
     }
 
     const fn next_state(
@@ -357,7 +357,18 @@ impl<State: MpduParsedUpToAddressing> MpduFieldRanges<State> {
     /// The buffer range containing all addressing fields.
     pub(crate) const fn try_range_addressing(&self) -> Option<Range<usize>> {
         let offset_addressing = self.offset_addressing.get() as usize;
+        let next_offset = self.end_addressing();
 
+        if next_offset == offset_addressing {
+            None
+        } else {
+            Some(offset_addressing..next_offset)
+        }
+    }
+
+    /// The buffer offset at which the addressing fields end, or at which they
+    /// would begin if they are absent.
+    pub(crate) const fn end_addressing(&self) -> usize {
         #[cfg(feature = "security")]
         let next_offset = self.offset_aux_sec_hdr.unwrap().get() as usize;
         #[cfg(all(not(feature = "security"), feature = "ies"))]
@@ -365,11 +376,7 @@ impl<State: MpduParsedUpToAddressing> MpduFieldRanges<State> {
         #[cfg(not(any(feature = "security", feature = "ies")))]
         let next_offset = self.offset_frame_payload.unwrap().get() as usize;
 
-        if next_offset == offset_addressing {
-            None
-        } else {
-            Some(offset_addressing..next_offset)
-        }
+        next_offset
     }
 }
 
