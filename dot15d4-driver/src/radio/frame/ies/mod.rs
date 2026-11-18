@@ -391,6 +391,30 @@ pub fn compute_ies_length_from_buffer(
     Ok((ies_length, frame_payload_length))
 }
 
+/// Compute the header IE length from a buffer whose payload IEs, if any, are
+/// encrypted (IEEE 802.15.4-2020, section 7.2.9): the header IEs and their
+/// termination IE belong to the IEs, and everything after them, payload IEs
+/// included, to the frame payload.
+pub fn compute_header_ies_length_from_buffer(
+    buf: &[u8],
+    total_ies_and_payload_len: u16,
+) -> Result<(u16, u16)> {
+    let mut iter = HeaderIeIter::new(buf);
+    let mut ies_length = 0;
+    while let Some(ie) = iter.next() {
+        ies_length = iter.offset() as u16;
+        if ie.is_termination() {
+            break;
+        }
+    }
+
+    if ies_length > total_ies_and_payload_len {
+        return Err(Error);
+    }
+
+    Ok((ies_length, total_ies_and_payload_len - ies_length))
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum IeRepr<'ie> {
     TimeCorrectionHeaderIe,

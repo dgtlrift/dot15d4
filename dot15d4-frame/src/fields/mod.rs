@@ -24,6 +24,8 @@
 mod field_ranges;
 mod ies;
 mod mpdu;
+mod security;
 
 pub use ies::*;
 pub use mpdu::*;
+pub use security::*;

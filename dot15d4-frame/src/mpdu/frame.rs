@@ -366,6 +366,142 @@ mod tests {
         assert_eq!(reader.try_fcs(), Some(&[0x01, 0x02, 0x03, 0x04][..]));
     }
 
+    /// Parses a secured PSDU with a 2-byte FCS up to all its fields.
+    #[cfg(feature = "security")]
+    fn parse_secured(psdu: &[u8]) -> Option<MpduParser<MpduSlice<'_>, crate::MpduWithAllFields>> {
+        MpduSlice::new(psdu, 2)?
+            .reader()
+            .parse_addressing()
+            .ok()?
+            .parse_security()
+            .ok()?
+            .parse_ies_with_fcs_length(2)
+            .ok()
+    }
+
+    /// A data frame, version 2, Security Enabled, PAN ID Compression, short
+    /// addresses (IEEE 802.15.4-2020, figure 7-2 and table 7-2), sequence
+    /// number 1; ENC-MIC-32 with a Key Index (section 9.4); an encrypted
+    /// payload, the MIC and the FCS.
+    #[cfg(feature = "security")]
+    const SECURED_DATA: [u8; 23] = [
+        0x49, 0xa8, 0x01, 0xcd, 0xab, 0x01, 0x00, 0x02, 0x00, // MHR
+        0x0d, 0x04, 0x03, 0x02, 0x01, 0x07, // Auxiliary Security Header
+        0xaa, 0xbb, // encrypted payload
+        0x11, 0x22, 0x33, 0x44, // MIC
+        0xf1, 0xf2, // FCS
+    ];
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn test_mpdu_slice_secured() {
+        let reader = parse_secured(&SECURED_DATA).unwrap();
+        assert!(reader.frame_control().security_enabled());
+        assert!(reader.is_encrypted());
+        let header = reader.try_aux_sec_header().unwrap();
+        assert_eq!(header.security_level(), 5);
+        assert_eq!(header.frame_counter(), Some(0x0102_0304));
+        assert_eq!(header.key_index(), Some(7));
+        assert_eq!(reader.try_frame_payload(), Some(&[0xaa, 0xbb][..]));
+        assert_eq!(reader.try_mic(), Some(&[0x11, 0x22, 0x33, 0x44][..]));
+        assert_eq!(reader.try_fcs(), Some(&[0xf1, 0xf2][..]));
+
+        // The MPDU must hold the MHR, the Auxiliary Security Header (to byte
+        // 15) and the MIC (4 bytes); whatever is left is the payload.
+        for len in 11..SECURED_DATA.len() {
+            let mpdu_len = len - 2;
+            let security = MpduSlice::new(&SECURED_DATA[..len], 2)
+                .unwrap()
+                .reader()
+                .parse_addressing()
+                .unwrap()
+                .parse_security();
+            let Ok(security) = security else {
+                assert!(mpdu_len < 19, "{len}");
+                continue;
+            };
+            assert!(mpdu_len >= 19, "{len}");
+            let reader = security.parse_ies_with_fcs_length(2).unwrap();
+            assert_eq!(
+                reader.try_frame_payload().map_or(0, <[u8]>::len),
+                mpdu_len - 19
+            );
+        }
+
+        // Security levels 0 and the reserved 4 aren't represented.
+        let mut psdu = SECURED_DATA;
+        for security_control in [0x08, 0x0c] {
+            psdu[9] = security_control;
+            assert!(MpduSlice::new(&psdu, 2)
+                .unwrap()
+                .reader()
+                .parse_addressing()
+                .unwrap()
+                .parse_security()
+                .is_err());
+        }
+
+        // An unsecured frame has no Auxiliary Security Header and no MIC.
+        let reader = MpduSlice::new(&ENHANCED_BEACON, 0)
+            .unwrap()
+            .reader()
+            .parse_addressing()
+            .unwrap()
+            .parse_security()
+            .unwrap()
+            .parse_ies_with_fcs_length(0)
+            .unwrap();
+        assert!(reader.try_aux_sec_header().is_none());
+        assert!(!reader.is_encrypted());
+        assert_eq!(reader.try_mic(), None);
+    }
+
+    #[cfg(all(feature = "security", feature = "ies"))]
+    #[test]
+    fn test_mpdu_slice_secured_ies() {
+        // A data frame, version 2, Security Enabled, IE Present, PAN ID
+        // Compression, short addresses, sequence number 1; then a header IE
+        // (Element ID 0x2a, 1 byte) and HT1; then payload IEs and payload.
+        let mhr = [
+            0x49, 0xaa, 0x01, 0xcd, 0xab, 0x01, 0x00, 0x02, 0x00, // MHR
+        ];
+        let header_ies = [0x01, 0x15, 0x5a, 0x00, 0x3f];
+        // An MLME payload IE with one 1-byte short nested IE, then a payload
+        // termination IE and one byte of payload.
+        let payload = [0x03, 0x88, 0x01, 0x40, 0x77, 0x00, 0xf8, 0x99];
+
+        // MIC-32: payload IEs in the clear.
+        let mut psdu = [0u8; 9 + 6 + 5 + 8 + 4 + 2];
+        psdu[..9].copy_from_slice(&mhr);
+        psdu[9..15].copy_from_slice(&[0x09, 0x04, 0x03, 0x02, 0x01, 0x07]);
+        psdu[15..20].copy_from_slice(&header_ies);
+        psdu[20..28].copy_from_slice(&payload);
+        psdu[28..32].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let reader = parse_secured(&psdu).unwrap();
+        assert!(!reader.is_encrypted());
+        let ies = reader.try_ies_slice().unwrap();
+        assert_eq!(ies.len(), 5 + 7);
+        assert_eq!(
+            reader
+                .try_ies_fields()
+                .unwrap()
+                .nested_ies()
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(reader.try_frame_payload(), Some(&[0x99][..]));
+        assert_eq!(reader.try_mic(), Some(&[0x11, 0x22, 0x33, 0x44][..]));
+
+        // ENC-MIC-32: the payload IEs are encrypted with the payload.
+        psdu[9] = 0x0d;
+        let reader = parse_secured(&psdu).unwrap();
+        assert!(reader.is_encrypted());
+        assert_eq!(reader.try_ies_slice(), Some(&header_ies[..]));
+        assert_eq!(reader.try_frame_payload(), Some(&payload[..]));
+        assert_eq!(reader.try_mic(), Some(&[0x11, 0x22, 0x33, 0x44][..]));
+    }
+
     #[test]
     fn test_mpdu_slice_truncated() {
         // Every prefix either parses or fails, without reading past the MPDU.
@@ -379,7 +515,11 @@ mod tests {
             };
             assert!(len >= 14, "{len}");
             let _ = reader.try_addressing_fields();
-            if let Ok(reader) = reader.parse_security().unwrap().parse_ies_with_fcs_length(0) {
+            if let Ok(reader) = reader
+                .parse_security()
+                .unwrap()
+                .parse_ies_with_fcs_length(0)
+            {
                 let _ = reader.try_frame_payload();
                 #[cfg(feature = "ies")]
                 if let Some(ies) = reader.try_ies_fields() {

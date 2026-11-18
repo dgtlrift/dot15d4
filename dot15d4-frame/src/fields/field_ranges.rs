@@ -169,8 +169,10 @@ impl MpduFieldRanges<MpduWithAddressing> {
             state: PhantomData,
             offset_frame_control: self.offset_frame_control,
             offset_addressing: self.offset_addressing,
+            // The Auxiliary Security Header begins where the addressing
+            // fields end; `next_offset` is where it ends.
             #[cfg(feature = "security")]
-            offset_aux_sec_hdr: as_nz_u8(next_offset),
+            offset_aux_sec_hdr: self.offset_aux_sec_hdr,
             #[cfg(feature = "security")]
             length_mic: _length_mic,
             #[cfg(feature = "ies")]
@@ -285,6 +287,18 @@ impl MpduFieldRanges<MpduWithSecurity> {
         Ok(self.next_state_with_fcs_length(0, frame_payload_length, fcs_length))
     }
 
+    /// The length of the MIC that ends the MAC payload: zero unless the frame
+    /// is secured.
+    pub(crate) const fn mic_length(&self) -> u16 {
+        #[cfg(feature = "security")]
+        return match self.length_mic {
+            Some(length_mic) => length_mic.get() as u16,
+            None => 0,
+        };
+        #[cfg(not(feature = "security"))]
+        return 0;
+    }
+
     /// Returns the offset where IEs start in the buffer.
     #[cfg(feature = "ies")]
     pub(crate) fn ies_offset(&self) -> u8 {
@@ -295,12 +309,10 @@ impl MpduFieldRanges<MpduWithSecurity> {
     /// remaining lengths).
     pub(crate) const fn last_offset(&self) -> u16 {
         #[cfg(feature = "ies")]
-        let last_offset = self.offset_ies.unwrap().get();
-        #[cfg(all(feature = "security", not(feature = "ies")))]
-        let last_offset = self.offset_aux_sec_hdr.unwrap().get();
-        #[cfg(not(any(feature = "security", feature = "ies")))]
-        let last_offset = self.offset_addressing.get();
-        last_offset as u16
+        let last_offset = self.offset_ies.unwrap().get() as u16;
+        #[cfg(not(feature = "ies"))]
+        let last_offset = self.offset_frame_payload.unwrap().get();
+        last_offset
     }
 
     const fn next_state<Config: DriverConfig>(
@@ -482,11 +494,9 @@ impl MpduFieldRanges<MpduWithAllFields> {
         #[cfg(feature = "security")]
         return {
             let next_offset = self.offset_fcs.unwrap().get() as usize;
-            let offset_mic = next_offset - self.length_mic.unwrap().get() as usize;
-            if offset_mic == next_offset {
-                None
-            } else {
-                Some(offset_mic..next_offset)
+            match self.length_mic {
+                Some(length_mic) => Some(next_offset - length_mic.get() as usize..next_offset),
+                None => None,
             }
         };
         #[cfg(not(feature = "security"))]

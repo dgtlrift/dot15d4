@@ -1,3 +1,5 @@
+#[cfg(feature = "security")]
+use dot15d4_driver::radio::frame::compute_header_ies_length_from_buffer;
 use dot15d4_driver::radio::frame::compute_ies_length_from_buffer;
 #[cfg(feature = "ies")]
 use dot15d4_driver::radio::frame::IeListRepr;
@@ -16,7 +18,10 @@ use dot15d4_util::{
     Error, Result as SimplifiedResult,
 };
 
+#[cfg(feature = "security")]
+use crate::repr::SecurityRepr;
 use crate::{
+    fields::AuxSecurityHeader,
     mpdu::{MpduBytes, MpduFrame},
     repr::SeqNrRepr,
     MpduParsedUpToAddressing, MpduParsedUpToSecurity, MpduWithAddressing, MpduWithAllFields,
@@ -498,21 +503,44 @@ impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, Mpdu
 
 /// MPDU reader at the addressing parsing stage.
 impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAddressing> {
-    /// Parses the frame control field to identify the security configuration of
-    /// the MPDU.
+    /// Parses the frame control field and, if the frame is secured, the
+    /// Security Control field of its Auxiliary Security Header to identify the
+    /// security configuration of the MPDU.
     ///
-    /// Security processing is not implemented yet, so a frame with the
-    /// Security Enabled bit set is rejected: the caller must handle the error,
-    /// in every build profile.
+    /// The frame is not unsecured: an encrypted MAC payload stays encrypted.
+    ///
+    /// Fails if the frame is secured and the `security` feature is disabled,
+    /// if its security level is 0 or the reserved 4, or if the MPDU is too
+    /// short to hold the Auxiliary Security Header and the MIC.
     pub fn parse_security(self) -> SimplifiedResult<MpduParser<ReadOnlyMpdu, MpduWithSecurity>> {
-        if self.frame_control().security_enabled() {
-            return Err(Error);
+        if !self.frame_control().security_enabled() {
+            return Ok(MpduParser {
+                mpdu_field_ranges: self.mpdu_field_ranges.without_security(),
+                mpdu: self.mpdu,
+            });
         }
 
-        Ok(MpduParser {
-            mpdu_field_ranges: self.mpdu_field_ranges.without_security(),
-            mpdu: self.mpdu,
-        })
+        #[cfg(feature = "security")]
+        {
+            let offset = self.mpdu_field_ranges.end_addressing();
+            if !self.ends_within_mpdu(offset + 1) {
+                return Err(Error);
+            }
+            let security_control = self.mpdu.mpdu_buffer()[offset];
+            let security = SecurityRepr::from_security_control(security_control).ok_or(Error)?;
+            let parser = MpduParser {
+                mpdu_field_ranges: self.mpdu_field_ranges.with_security(security),
+                mpdu: self.mpdu,
+            };
+            let end = offset + security.aux_sec_header_length() as usize;
+            if !parser.ends_within_mpdu(end + security.mic_length() as usize) {
+                return Err(Error);
+            }
+            Ok(parser)
+        }
+
+        #[cfg(not(feature = "security"))]
+        Err(Error)
     }
 }
 
@@ -541,14 +569,20 @@ impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithSecurity> {
         fcs_length: u8,
     ) -> SimplifiedResult<MpduParser<ReadOnlyMpdu, MpduWithAllFields>> {
         let fc = self.frame_control();
+        // The MIC ends the MAC payload: parse the IEs and the frame payload
+        // before it.
+        let mic_length = self.mpdu_field_ranges.mic_length();
         let mpdu_length_wo_fcs = self.mpdu.mpdu_length_wo_fcs();
+        let Some(mpdu_length_wo_mic) = mpdu_length_wo_fcs.checked_sub(mic_length) else {
+            return Err(Error);
+        };
         let fcs_length = fcs_length as u16;
 
         if !fc.information_elements_present() {
             // No IEs present - use without IEs path
             let mpdu_field_ranges = self
                 .mpdu_field_ranges
-                .try_without_ies_with_mpdu_length(mpdu_length_wo_fcs, fcs_length)?;
+                .try_without_ies_with_mpdu_length(mpdu_length_wo_mic, fcs_length)?;
             return Ok(MpduParser {
                 mpdu_field_ranges,
                 mpdu: self.mpdu,
@@ -559,19 +593,28 @@ impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithSecurity> {
         // Compute lengths from buffer
         let mpdu_less_ies_and_payload =
             self.mpdu_field_ranges.last_offset() - self.mpdu.mpdu_offset() as u16;
-        if mpdu_less_ies_and_payload > mpdu_length_wo_fcs {
+        if mpdu_less_ies_and_payload > mpdu_length_wo_mic {
             return Err(Error);
         }
-        let mpdu_ies_and_payload = mpdu_length_wo_fcs - mpdu_less_ies_and_payload;
+        let mpdu_ies_and_payload = mpdu_length_wo_mic - mpdu_less_ies_and_payload;
 
         // Get IE buffer slice - starts after header fields (at offset_ies)
         let ies_start = self.mpdu_field_ranges.ies_offset() as usize;
-        let ies_end = self.mpdu.mpdu_offset() as usize + mpdu_length_wo_fcs as usize;
+        let ies_end = self.mpdu.mpdu_offset() as usize + mpdu_length_wo_mic as usize;
         let ies_buffer = &self.mpdu.mpdu_buffer()[ies_start..ies_end];
 
-        // Compute IE length by parsing the buffer
-        let (ies_length, frame_payload_length) =
-            compute_ies_length_from_buffer(ies_buffer, mpdu_ies_and_payload)?;
+        // Compute IE length by parsing the buffer. Payload IEs of an encrypted
+        // frame are part of the encrypted frame payload.
+        let (ies_length, frame_payload_length) = if self.is_encrypted() {
+            #[cfg(feature = "security")]
+            {
+                compute_header_ies_length_from_buffer(ies_buffer, mpdu_ies_and_payload)?
+            }
+            #[cfg(not(feature = "security"))]
+            unreachable!()
+        } else {
+            compute_ies_length_from_buffer(ies_buffer, mpdu_ies_and_payload)?
+        };
 
         let mpdu_field_ranges = self.mpdu_field_ranges.with_parsed_ies_length(
             ies_length,
@@ -652,8 +695,24 @@ impl<'mpdu, State: MpduParsedUpToAddressing> MpduParser<&'mpdu MpduFrame, State>
 
 /// Exposes fields accessible from an MPDU at the security parsing stage or
 /// beyond.
-impl<AnyMpdu, State: MpduParsedUpToSecurity> MpduParser<AnyMpdu, State> {
-    // TODO: Add access to the aux security header and MIC.
+impl<ReadOnlyMpdu: MpduBytes, State: MpduParsedUpToSecurity> MpduParser<ReadOnlyMpdu, State> {
+    /// Provides read-only access to the Auxiliary Security Header, or
+    /// [`None`] if the frame is not secured.
+    pub fn try_aux_sec_header(&self) -> Option<AuxSecurityHeader<&[u8]>> {
+        let range = self.mpdu_field_ranges.try_range_aux_sec_header()?;
+        AuxSecurityHeader::new(&self.mpdu.mpdu_buffer()[range])
+    }
+
+    /// Whether the frame's MAC payload is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        #[cfg(feature = "security")]
+        return self
+            .try_aux_sec_header()
+            .and_then(|header| SecurityRepr::from_security_control(header.security_control()))
+            .is_some_and(|security| security.security_level().is_encrypted());
+        #[cfg(not(feature = "security"))]
+        return false;
+    }
 }
 
 /// Exposes read-only fields accessible from an MPDU once it is fully parsed.
@@ -666,6 +725,11 @@ impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
         self.mpdu
             .mpdu_buffer()
             .get(self.mpdu_field_ranges.try_range_fcs()?)
+    }
+
+    /// The MIC of a secured frame, or [`None`] if the frame is not secured.
+    pub fn try_mic(&self) -> Option<&[u8]> {
+        Some(&self.mpdu.mpdu_buffer()[self.mpdu_field_ranges.try_range_mic()?])
     }
 }
 
