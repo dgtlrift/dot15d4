@@ -239,13 +239,16 @@ impl MpduFieldRanges<MpduWithSecurity> {
     /// and frame payload length have been computed directly from parsing the
     /// buffer. This is useful when parsing incoming radio frames without
     /// building an IeListRepr.
+    ///
+    /// The FCS of `fcs_length` bytes follows the frame payload.
     #[cfg(feature = "ies")]
-    pub(crate) fn with_parsed_ies_length<Config: DriverConfig>(
+    pub(crate) fn with_parsed_ies_length(
         &self,
         ies_length: u16,
         frame_payload_length: u16,
+        fcs_length: u16,
     ) -> MpduFieldRanges<MpduWithAllFields> {
-        self.next_state::<Config>(ies_length, frame_payload_length)
+        self.next_state_with_fcs_length(ies_length, frame_payload_length, fcs_length)
     }
 
     /// Call this method to finalize the frame without IEs when the frame
@@ -267,16 +270,19 @@ impl MpduFieldRanges<MpduWithSecurity> {
     /// bytes consumed by the MAC header and MAC payload without the MAC footer.
     ///
     /// See [`dot15d4_driver::radio::frame::RadioFrame::sdu_wo_fcs_length()`].
-    pub(crate) const fn try_without_ies_with_mpdu_length<Config: DriverConfig>(
+    ///
+    /// The FCS of `fcs_length` bytes follows the frame payload.
+    pub(crate) const fn try_without_ies_with_mpdu_length(
         &self,
         mpdu_length_wo_fcs: u16,
+        fcs_length: u16,
     ) -> Result<MpduFieldRanges<MpduWithAllFields>> {
         let mpdu_less_payload_length = self.last_offset() - self.offset_frame_control as u16;
         if mpdu_less_payload_length > mpdu_length_wo_fcs {
             return Err(Error);
         }
         let frame_payload_length = mpdu_length_wo_fcs - mpdu_less_payload_length;
-        Ok(self.next_state::<Config>(0, frame_payload_length))
+        Ok(self.next_state_with_fcs_length(0, frame_payload_length, fcs_length))
     }
 
     /// Returns the offset where IEs start in the buffer.
@@ -302,6 +308,19 @@ impl MpduFieldRanges<MpduWithSecurity> {
         ies_length: u16,
         frame_payload_length: u16,
     ) -> MpduFieldRanges<MpduWithAllFields> {
+        self.next_state_with_fcs_length(
+            ies_length,
+            frame_payload_length,
+            size_of::<<Config as DriverConfig>::Fcs>() as u16,
+        )
+    }
+
+    const fn next_state_with_fcs_length(
+        &self,
+        ies_length: u16,
+        frame_payload_length: u16,
+        fcs_length: u16,
+    ) -> MpduFieldRanges<MpduWithAllFields> {
         let offset_frame_payload = self.last_offset() + ies_length;
 
         #[cfg(feature = "security")]
@@ -313,7 +332,7 @@ impl MpduFieldRanges<MpduWithSecurity> {
         let length_mic = 0;
         let offset_fcs = offset_frame_payload + frame_payload_length + length_mic;
 
-        let offset_remainder = offset_fcs + size_of::<<Config as DriverConfig>::Fcs>() as u16;
+        let offset_remainder = offset_fcs + fcs_length;
         MpduFieldRanges {
             state: PhantomData,
             offset_frame_control: self.offset_frame_control,

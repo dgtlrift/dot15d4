@@ -1,13 +1,15 @@
 use core::{num::NonZero, ops::Range};
 
 use dot15d4_driver::radio::{
-    frame::{RadioFrame, RadioFrameSized},
+    frame::{FrameControl, RadioFrame, RadioFrameSized},
     DriverConfig,
 };
 use dot15d4_util::{
     allocator::{BufferToken, IntoBuffer},
     frame::FramePdu,
 };
+
+use crate::{fields::MpduParser, repr::SeqNrRepr, MpduWithFrameControl};
 
 /// An unparsed MPDU.
 #[derive(Debug, PartialEq, Eq)]
@@ -122,5 +124,274 @@ impl FramePdu for MpduFrame {
 
     fn pdu_mut(&mut self) -> &mut Self {
         self
+    }
+}
+
+/// Read access to the bytes of an unparsed MPDU.
+///
+/// [`MpduParser`] reads frames through this trait, so it parses both an
+/// [`MpduFrame`] in a radio buffer and an [`MpduSlice`] in a plain byte slice.
+pub trait MpduBytes {
+    /// The bytes that hold the MPDU, which may begin with headroom.
+    fn mpdu_buffer(&self) -> &[u8];
+
+    /// The offset in [`Self::mpdu_buffer()`] at which the MPDU begins.
+    fn mpdu_offset(&self) -> u8;
+
+    /// The length of the MPDU without its FCS.
+    fn mpdu_length_wo_fcs(&self) -> u16;
+
+    /// Provides read-only access to the [`FrameControl`] field.
+    fn mpdu_frame_control(&self) -> FrameControl<&[u8]> {
+        let offset = self.mpdu_offset() as usize;
+        FrameControl::new_unchecked(&self.mpdu_buffer()[offset..offset + 2])
+    }
+
+    /// Reads the sequence number field.
+    ///
+    /// Returns [`None`] if the sequence number is suppressed or if the MPDU
+    /// is too short to hold it.
+    fn mpdu_sequence_number(&self) -> Option<u8> {
+        const OFFSET_SEQ_NR: u16 = 2;
+        if self.mpdu_frame_control().sequence_number_suppression()
+            || self.mpdu_length_wo_fcs() <= OFFSET_SEQ_NR
+        {
+            return None;
+        }
+        Some(self.mpdu_buffer()[self.mpdu_offset() as usize + OFFSET_SEQ_NR as usize])
+    }
+}
+
+impl MpduBytes for MpduFrame {
+    fn mpdu_buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn mpdu_offset(&self) -> u8 {
+        self.offset
+    }
+
+    fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.length_wo_fcs.get()
+    }
+}
+
+impl MpduBytes for &MpduFrame {
+    fn mpdu_buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn mpdu_offset(&self) -> u8 {
+        self.offset
+    }
+
+    fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.length_wo_fcs.get()
+    }
+}
+
+impl MpduBytes for &mut MpduFrame {
+    fn mpdu_buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn mpdu_offset(&self) -> u8 {
+        self.offset
+    }
+
+    fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.length_wo_fcs.get()
+    }
+}
+
+/// An unparsed MPDU in a byte slice.
+///
+/// Parses frames that were not received into a radio buffer, for example
+/// from a capture file, a trace or a test, without a buffer allocator:
+///
+/// ```
+/// # use dot15d4_frame::mpdu::MpduSlice;
+/// // A data frame with short addresses and a 2-byte FCS.
+/// let psdu = [
+///     0x41, 0x88, 0x01, 0xcd, 0xab, 0xff, 0xff, 0x01, 0x00, 0x2a, 0x00, 0x00,
+/// ];
+/// let mpdu = MpduSlice::new(&psdu, 2).unwrap();
+/// let reader = mpdu.reader().parse_addressing().unwrap();
+/// let addressing = reader.try_addressing_fields().unwrap();
+/// assert_eq!(addressing.try_dst_pan_id().unwrap().into_u16(), 0xabcd);
+/// let reader = reader
+///     .parse_security()
+///     .unwrap()
+///     .parse_ies_with_fcs_length(mpdu.fcs_length())
+///     .unwrap();
+/// assert_eq!(reader.try_frame_payload(), Some(&[0x2a][..]));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MpduSlice<'a> {
+    bytes: &'a [u8],
+    length_wo_fcs: NonZero<u16>,
+    fcs_length: u8,
+}
+
+impl<'a> MpduSlice<'a> {
+    /// Wraps a PSDU: an MPDU followed by its FCS of `fcs_length` bytes (0, 2
+    /// or 4, as the PHY and the driver dictate).
+    ///
+    /// Returns [`None`] if the MPDU is too short to hold a frame control
+    /// field, or longer than [`u16::MAX`] bytes.
+    pub fn new(psdu: &'a [u8], fcs_length: u8) -> Option<Self> {
+        const FRAME_CONTROL_LEN: usize = 2;
+        let length_wo_fcs = psdu.len().checked_sub(fcs_length as usize)?;
+        if length_wo_fcs < FRAME_CONTROL_LEN {
+            return None;
+        }
+        Some(Self {
+            bytes: psdu,
+            length_wo_fcs: NonZero::new(u16::try_from(length_wo_fcs).ok()?)?,
+            fcs_length,
+        })
+    }
+
+    /// The length of the FCS that follows the MPDU.
+    pub fn fcs_length(&self) -> u8 {
+        self.fcs_length
+    }
+
+    /// Starts parsing the MPDU.
+    pub fn reader(self) -> MpduParser<Self, MpduWithFrameControl> {
+        MpduParser::new(
+            self,
+            if self.mpdu_frame_control().sequence_number_suppression() {
+                SeqNrRepr::No
+            } else {
+                SeqNrRepr::Yes
+            },
+        )
+    }
+}
+
+impl MpduBytes for MpduSlice<'_> {
+    fn mpdu_buffer(&self) -> &[u8] {
+        self.bytes
+    }
+
+    fn mpdu_offset(&self) -> u8 {
+        0
+    }
+
+    fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.length_wo_fcs.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dot15d4_driver::radio::frame::{AddressingMode, FrameType, FrameVersion};
+
+    use super::*;
+
+    /// An Enhanced Beacon without its FCS: short broadcast destination, PAN ID
+    /// 0xabcd, extended source, sequence number suppressed, HT1 and an MLME
+    /// payload IE with TSCH Synchronization, Timeslot, Channel Hopping and
+    /// Slotframe and Link nested IEs.
+    const ENHANCED_BEACON: [u8; 35] = [
+        0x40, 0xeb, 0xcd, 0xab, 0xff, 0xff, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x3f, 0x11, 0x88, 0x06, 0x1a, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x1c, 0x00, 0x01,
+        0xc8, 0x00, 0x01, 0x1b, 0x00,
+    ];
+
+    #[test]
+    fn test_mpdu_slice_new() {
+        assert!(MpduSlice::new(&[], 0).is_none());
+        assert!(MpduSlice::new(&[0x41], 0).is_none());
+        assert!(MpduSlice::new(&[0x41, 0x88], 1).is_none());
+        assert!(MpduSlice::new(&[0x41, 0x88, 0x00], 4).is_none());
+        let mpdu = MpduSlice::new(&[0x41, 0x88, 0x00, 0x00], 2).unwrap();
+        assert_eq!(mpdu.mpdu_length_wo_fcs(), 2);
+        assert_eq!(mpdu.fcs_length(), 2);
+    }
+
+    #[test]
+    fn test_mpdu_slice_enhanced_beacon() {
+        let mpdu = MpduSlice::new(&ENHANCED_BEACON, 0).unwrap();
+        let reader = mpdu.reader();
+        let fc = reader.frame_control();
+        assert_eq!(fc.frame_type(), FrameType::Beacon);
+        assert_eq!(fc.frame_version(), FrameVersion::Ieee802154);
+        assert_eq!(fc.dst_addressing_mode(), AddressingMode::Short);
+        assert_eq!(fc.src_addressing_mode(), AddressingMode::Extended);
+        assert!(fc.information_elements_present());
+        assert_eq!(reader.sequence_number(), None);
+
+        let reader = reader.parse_addressing().unwrap();
+        let addressing = reader.try_addressing_fields().unwrap();
+        assert_eq!(addressing.try_dst_pan_id().unwrap().into_u16(), 0xabcd);
+        assert!(addressing.try_dst_address().unwrap().is_broadcast());
+        assert!(addressing.try_src_address().unwrap().is_extended());
+
+        let reader = reader
+            .parse_security()
+            .unwrap()
+            .parse_ies_with_fcs_length(0)
+            .unwrap();
+        assert_eq!(reader.try_frame_payload(), None);
+        assert_eq!(reader.try_fcs(), None);
+
+        #[cfg(feature = "ies")]
+        {
+            let ies = reader.try_ies_fields().unwrap();
+            assert_eq!(ies.tsch_sync().unwrap().asn(), 14);
+            assert_eq!(ies.nested_ies().unwrap().count(), 4);
+        }
+    }
+
+    #[test]
+    fn test_mpdu_slice_fcs() {
+        // A data frame with short addresses, a payload and a 4-byte FCS.
+        let psdu = [
+            0x41, 0x88, 0x01, 0xcd, 0xab, 0xff, 0xff, 0x01, 0x00, 0x2a, 0x2b, 0x01, 0x02, 0x03,
+            0x04,
+        ];
+        let mpdu = MpduSlice::new(&psdu, 4).unwrap();
+        let reader = mpdu
+            .reader()
+            .parse_addressing()
+            .unwrap()
+            .parse_security()
+            .unwrap()
+            .parse_ies_with_fcs_length(mpdu.fcs_length())
+            .unwrap();
+        assert_eq!(reader.sequence_number(), Some(1));
+        assert_eq!(reader.try_frame_payload(), Some(&[0x2a, 0x2b][..]));
+        assert_eq!(reader.try_fcs(), Some(&[0x01, 0x02, 0x03, 0x04][..]));
+    }
+
+    #[test]
+    fn test_mpdu_slice_truncated() {
+        // Every prefix either parses or fails, without reading past the MPDU.
+        for len in 2..ENHANCED_BEACON.len() {
+            let mpdu = MpduSlice::new(&ENHANCED_BEACON[..len], 0).unwrap();
+            let reader = mpdu.reader();
+            let _ = reader.sequence_number();
+            let Ok(reader) = reader.parse_addressing() else {
+                assert!(len < 14, "{len}");
+                continue;
+            };
+            assert!(len >= 14, "{len}");
+            let _ = reader.try_addressing_fields();
+            if let Ok(reader) = reader.parse_security().unwrap().parse_ies_with_fcs_length(0) {
+                let _ = reader.try_frame_payload();
+                #[cfg(feature = "ies")]
+                if let Some(ies) = reader.try_ies_fields() {
+                    let _ = ies.header_ies().count();
+                    let _ = ies.nested_ies().map(Iterator::count);
+                }
+            }
+        }
+
+        // A sequence number that doesn't fit is absent.
+        let mpdu = MpduSlice::new(&[0x41, 0x88], 0).unwrap();
+        assert_eq!(mpdu.reader().sequence_number(), None);
+        assert!(mpdu.reader().parse_addressing().is_err());
     }
 }

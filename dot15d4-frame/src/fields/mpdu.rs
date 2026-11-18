@@ -17,8 +17,10 @@ use dot15d4_util::{
 };
 
 use crate::{
-    mpdu::MpduFrame, repr::SeqNrRepr, MpduParsedUpToAddressing, MpduParsedUpToSecurity,
-    MpduWithAddressing, MpduWithAllFields, MpduWithFrameControl, MpduWithSecurity,
+    mpdu::{MpduBytes, MpduFrame},
+    repr::SeqNrRepr,
+    MpduParsedUpToAddressing, MpduParsedUpToSecurity, MpduWithAddressing, MpduWithAllFields,
+    MpduWithFrameControl, MpduWithSecurity,
 };
 
 #[cfg(feature = "ies")]
@@ -172,6 +174,24 @@ impl MpduFrame {
 pub struct MpduParser<AnyMpdu, State> {
     mpdu_field_ranges: MpduFieldRanges<State>,
     mpdu: AnyMpdu,
+}
+
+impl<AnyMpdu: MpduBytes> MpduParser<AnyMpdu, MpduWithFrameControl> {
+    /// Starts parsing an MPDU whose sequence number is present or not, as
+    /// its frame control field says.
+    pub(crate) fn new(mpdu: AnyMpdu, seq_nr: SeqNrRepr) -> Self {
+        Self {
+            mpdu_field_ranges: MpduFieldRanges::new(mpdu.mpdu_offset(), seq_nr),
+            mpdu,
+        }
+    }
+}
+
+impl<AnyMpdu: MpduBytes, State> MpduParser<AnyMpdu, State> {
+    /// Whether a field that ends at buffer offset `end` lies within the MPDU.
+    fn ends_within_mpdu(&self, end: usize) -> bool {
+        end <= self.mpdu.mpdu_offset() as usize + self.mpdu.mpdu_length_wo_fcs() as usize
+    }
 }
 
 impl<'repr> MpduRepr<'repr, MpduWithIes> {
@@ -340,18 +360,18 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
 }
 
 /// A read-only proxy to fields accessible from an MPDU in any parsing state.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>, State> MpduParser<ReadOnlyMpdu, State> {
-    /// See [`MpduFrame::frame_control()`].
+impl<ReadOnlyMpdu: MpduBytes, State> MpduParser<ReadOnlyMpdu, State> {
+    /// See [`MpduBytes::mpdu_frame_control()`].
     ///
     /// Note: Only read access to the full frame control field is provided as
     ///       the frame may no longer be changed structurally at this stage.
     pub fn frame_control(&self) -> FrameControl<&[u8]> {
-        self.mpdu.as_ref().frame_control()
+        self.mpdu.mpdu_frame_control()
     }
 
-    /// See [`MpduFrame::sequence_number()`].
+    /// See [`MpduBytes::mpdu_sequence_number()`].
     pub fn sequence_number(&self) -> Option<u8> {
-        self.mpdu.as_ref().sequence_number()
+        self.mpdu.mpdu_sequence_number()
     }
 
     /// Check whether the frame is a valid IEEE 802.15.4 frame.
@@ -428,9 +448,11 @@ impl<State> MpduParser<MpduFrame, State> {
 }
 
 /// MPDU reader at the initial frame-control parsing stage.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithFrameControl> {
+impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithFrameControl> {
     /// Parses the frame control field to identify the addressing configuration
     /// of the MPDU.
+    ///
+    /// Fails if the MPDU is too short to hold the addressing fields.
     pub fn parse_addressing(
         self,
     ) -> SimplifiedResult<MpduParser<ReadOnlyMpdu, MpduWithAddressing>> {
@@ -441,17 +463,20 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithFrameContr
             self.mpdu_field_ranges.without_addressing()
         };
 
-        Ok(MpduParser {
+        let parser = MpduParser {
             mpdu_field_ranges,
             mpdu: self.mpdu,
-        })
+        };
+        let addressing_end = parser.mpdu_field_ranges.end_addressing();
+        if !parser.ends_within_mpdu(addressing_end) {
+            return Err(Error);
+        }
+        Ok(parser)
     }
 }
 
 /// MPDU writer at the initial frame-control parsing stage.
-impl<ReadWriteMpdu: AsRef<MpduFrame> + AsMut<MpduFrame>>
-    MpduParser<ReadWriteMpdu, MpduWithFrameControl>
-{
+impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, MpduWithFrameControl> {
     /// Parses the frame control field to identify the addressing configuration
     /// of the MPDU.
     pub fn parse_addressing_mut(
@@ -472,7 +497,7 @@ impl<ReadWriteMpdu: AsRef<MpduFrame> + AsMut<MpduFrame>>
 }
 
 /// MPDU reader at the addressing parsing stage.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithAddressing> {
+impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAddressing> {
     /// Parses the frame control field to identify the security configuration of
     /// the MPDU.
     ///
@@ -492,20 +517,38 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithAddressing
 }
 
 /// MPDU reader at the security parsing stage.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithSecurity> {
+impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithSecurity> {
     /// Parses the frame control and information element fields to identify the
     /// information elements of the MPDU.
+    ///
+    /// The driver configuration gives the length of the FCS.
     pub fn parse_ies<Config: DriverConfig>(
         self,
     ) -> SimplifiedResult<MpduParser<ReadOnlyMpdu, MpduWithAllFields>> {
+        self.parse_ies_with_fcs_length(size_of::<<Config as DriverConfig>::Fcs>() as u8)
+    }
+
+    /// Parses the frame control and information element fields to identify the
+    /// information elements of the MPDU, which is followed by an FCS of
+    /// `fcs_length` bytes.
+    ///
+    /// Use this method for an [`MpduSlice`], which has no driver
+    /// configuration.
+    ///
+    /// [`MpduSlice`]: crate::mpdu::MpduSlice
+    pub fn parse_ies_with_fcs_length(
+        self,
+        fcs_length: u8,
+    ) -> SimplifiedResult<MpduParser<ReadOnlyMpdu, MpduWithAllFields>> {
         let fc = self.frame_control();
-        let mpdu_length_wo_fcs = self.mpdu.as_ref().pdu_length_wo_fcs();
+        let mpdu_length_wo_fcs = self.mpdu.mpdu_length_wo_fcs();
+        let fcs_length = fcs_length as u16;
 
         if !fc.information_elements_present() {
             // No IEs present - use without IEs path
             let mpdu_field_ranges = self
                 .mpdu_field_ranges
-                .try_without_ies_with_mpdu_length::<Config>(mpdu_length_wo_fcs)?;
+                .try_without_ies_with_mpdu_length(mpdu_length_wo_fcs, fcs_length)?;
             return Ok(MpduParser {
                 mpdu_field_ranges,
                 mpdu: self.mpdu,
@@ -515,7 +558,7 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithSecurity> 
         // IEs are present - need to parse them to determine their length
         // Compute lengths from buffer
         let mpdu_less_ies_and_payload =
-            self.mpdu_field_ranges.last_offset() - self.mpdu.as_ref().offset as u16;
+            self.mpdu_field_ranges.last_offset() - self.mpdu.mpdu_offset() as u16;
         if mpdu_less_ies_and_payload > mpdu_length_wo_fcs {
             return Err(Error);
         }
@@ -523,16 +566,18 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithSecurity> 
 
         // Get IE buffer slice - starts after header fields (at offset_ies)
         let ies_start = self.mpdu_field_ranges.ies_offset() as usize;
-        let ies_end = self.mpdu.as_ref().offset as usize + mpdu_length_wo_fcs as usize;
-        let ies_buffer = &self.mpdu.as_ref().buffer[ies_start..ies_end];
+        let ies_end = self.mpdu.mpdu_offset() as usize + mpdu_length_wo_fcs as usize;
+        let ies_buffer = &self.mpdu.mpdu_buffer()[ies_start..ies_end];
 
         // Compute IE length by parsing the buffer
         let (ies_length, frame_payload_length) =
             compute_ies_length_from_buffer(ies_buffer, mpdu_ies_and_payload)?;
 
-        let mpdu_field_ranges = self
-            .mpdu_field_ranges
-            .with_parsed_ies_length::<Config>(ies_length, frame_payload_length);
+        let mpdu_field_ranges = self.mpdu_field_ranges.with_parsed_ies_length(
+            ies_length,
+            frame_payload_length,
+            fcs_length,
+        );
 
         Ok(MpduParser {
             mpdu_field_ranges,
@@ -543,9 +588,7 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithSecurity> 
 
 /// Exposes read-only fields accessible from an MPDU at the addressing
 /// parsing stage or beyond.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>, State: MpduParsedUpToAddressing>
-    MpduParser<ReadOnlyMpdu, State>
-{
+impl<ReadOnlyMpdu: MpduBytes, State: MpduParsedUpToAddressing> MpduParser<ReadOnlyMpdu, State> {
     /// Tries to provide read-only addressing field access.
     ///
     /// Fails if the frame control field is invalid or the MPDU does not contain
@@ -554,13 +597,13 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>, State: MpduParsedUpToAddressing>
         let range_addressing = self.mpdu_field_ranges.try_range_addressing().ok_or(Error)?;
         let addressing_repr = AddressingRepr::try_from_frame_control(self.frame_control())?;
 
-        AddressingFields::try_new(&self.mpdu.as_ref().buffer[range_addressing], addressing_repr)
+        AddressingFields::try_new(&self.mpdu.mpdu_buffer()[range_addressing], addressing_repr)
     }
 }
 
 /// Exposes writable fields accessible from an MPDU at the addressing
 /// parsing stage or beyond.
-impl<ReadWriteMpdu: AsRef<MpduFrame> + AsMut<MpduFrame>, State: MpduParsedUpToAddressing>
+impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>, State: MpduParsedUpToAddressing>
     MpduParser<ReadWriteMpdu, State>
 {
     /// Writable addressing field access.
@@ -614,24 +657,26 @@ impl<AnyMpdu, State: MpduParsedUpToSecurity> MpduParser<AnyMpdu, State> {
 }
 
 /// Exposes read-only fields accessible from an MPDU once it is fully parsed.
-impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
+impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
     pub fn try_frame_payload(&self) -> Option<&[u8]> {
-        Some(&self.mpdu.as_ref().buffer[self.mpdu_field_ranges.try_range_frame_payload()?])
+        Some(&self.mpdu.mpdu_buffer()[self.mpdu_field_ranges.try_range_frame_payload()?])
     }
 
     pub fn try_fcs(&self) -> Option<&[u8]> {
-        Some(&self.mpdu.as_ref().buffer[self.mpdu_field_ranges.try_range_fcs()?])
+        self.mpdu
+            .mpdu_buffer()
+            .get(self.mpdu_field_ranges.try_range_fcs()?)
     }
 }
 
 /// Exposes read-only IE field access from a fully parsed MPDU.
 #[cfg(feature = "ies")]
-impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
+impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
     /// Returns the raw IE bytes slice, or `None` if no IEs present.
     #[inline]
     pub fn try_ies_slice(&self) -> Option<&[u8]> {
         let range = self.mpdu_field_ranges.try_range_ies()?;
-        Some(&self.mpdu.as_ref().buffer[range])
+        Some(&self.mpdu.mpdu_buffer()[range])
     }
 
     /// Returns an `IeFields` accessor, or `None` if no IEs present.
@@ -643,9 +688,7 @@ impl<ReadOnlyMpdu: AsRef<MpduFrame>> MpduParser<ReadOnlyMpdu, MpduWithAllFields>
 
 /// Exposes mutable IE field access from a fully parsed MPDU.
 #[cfg(feature = "ies")]
-impl<ReadWriteMpdu: AsRef<MpduFrame> + AsMut<MpduFrame>>
-    MpduParser<ReadWriteMpdu, MpduWithAllFields>
-{
+impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, MpduWithAllFields> {
     /// Returns mutable IE bytes slice.
     ///
     /// # Panics
