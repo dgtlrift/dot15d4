@@ -10,8 +10,10 @@ pub mod nested_ie_id {
     pub const TSCH_SLOTFRAME_LINK: u8 = 0x1b;
     pub const TSCH_TIMESLOT: u8 = 0x1c;
     pub const HOPPING_TIMING: u8 = 0x1d;
+    pub const SUN_DEVICE_CAPABILITIES: u8 = 0x22;
 
     // Long format
+    pub const VENDOR_SPECIFIC: u8 = 0x08;
     pub const CHANNEL_HOPPING: u8 = 0x09;
 }
 
@@ -610,6 +612,246 @@ impl<Bytes: AsRef<[u8]> + AsMut<[u8]>> ChannelHoppingIe<Bytes> {
     }
 }
 
+pub mod sun_features {
+    //! SUN Features bit masks (IEEE 802.15.4-2020, figure 7-63)
+    pub const ENH_ACK: u8 = 0x01;
+    pub const DATA_WHITENING: u8 = 0x02;
+    pub const INTERLEAVING: u8 = 0x04;
+    pub const SFD_GROUP_1: u8 = 0x08;
+    pub const NRNSC_FEC: u8 = 0x10;
+    pub const RSC_FEC: u8 = 0x20;
+    pub const MODE_SWITCH: u8 = 0x40;
+    pub const EXTENDED_BAND_IDENTIFIER: u8 = 0x80;
+}
+
+/// SUN Device Capabilities Nested IE content (Short format, variable length).
+///
+/// Format (IEEE 802.15.4-2020, section 7.4.4.10, figure 7-62):
+/// - Byte 0: SUN Features (see [`sun_features`])
+/// - Bytes 1-2, or 1-4 if the Extended Band Identifier bit is set: Frequency
+///   Bands Supported, a bitmap indexed by frequency band identifier
+///   (tables 7-21 and 7-22)
+/// - Remaining bytes: PHY Type Descriptors (see [`PhyTypeDescriptor`])
+#[derive(Clone, Copy)]
+pub struct SunDeviceCapabilitiesIe<Bytes> {
+    bytes: Bytes,
+}
+
+impl<Bytes: AsRef<[u8]>> SunDeviceCapabilitiesIe<Bytes> {
+    pub const MIN_LENGTH: usize = 3;
+
+    /// Returns `None` if the content is too short for the SUN Features and
+    /// Frequency Bands Supported fields.
+    #[inline]
+    pub fn new(bytes: Bytes) -> Option<Self> {
+        let ie = Self { bytes };
+        let b = ie.bytes.as_ref();
+        if b.is_empty() || b.len() < 1 + ie.bands_length() {
+            return None;
+        }
+        Some(ie)
+    }
+
+    #[inline]
+    pub const fn new_unchecked(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+
+    /// SUN Features field (see [`sun_features`] for its bits).
+    #[inline]
+    pub fn sun_features(&self) -> u8 {
+        self.bytes.as_ref()[0]
+    }
+
+    #[inline]
+    pub fn enh_ack(&self) -> bool {
+        self.sun_features() & sun_features::ENH_ACK != 0
+    }
+
+    #[inline]
+    pub fn data_whitening(&self) -> bool {
+        self.sun_features() & sun_features::DATA_WHITENING != 0
+    }
+
+    #[inline]
+    pub fn interleaving(&self) -> bool {
+        self.sun_features() & sun_features::INTERLEAVING != 0
+    }
+
+    #[inline]
+    pub fn sfd_group_1(&self) -> bool {
+        self.sun_features() & sun_features::SFD_GROUP_1 != 0
+    }
+
+    #[inline]
+    pub fn nrnsc_fec(&self) -> bool {
+        self.sun_features() & sun_features::NRNSC_FEC != 0
+    }
+
+    #[inline]
+    pub fn rsc_fec(&self) -> bool {
+        self.sun_features() & sun_features::RSC_FEC != 0
+    }
+
+    /// Whether the mode switch mechanism (section 19.5) is supported.
+    #[inline]
+    pub fn mode_switch(&self) -> bool {
+        self.sun_features() & sun_features::MODE_SWITCH != 0
+    }
+
+    /// Whether the band bitmaps are 4 bytes long instead of 2.
+    #[inline]
+    pub fn extended_band_identifier(&self) -> bool {
+        self.sun_features() & sun_features::EXTENDED_BAND_IDENTIFIER != 0
+    }
+
+    /// Length of a band bitmap in this IE: 2 or 4 bytes.
+    #[inline]
+    fn bands_length(&self) -> usize {
+        if self.extended_band_identifier() {
+            4
+        } else {
+            2
+        }
+    }
+
+    /// Frequency Bands Supported: bit n is set if frequency band identifier n
+    /// is supported.
+    #[inline]
+    pub fn frequency_bands_supported(&self) -> u32 {
+        read_bands(&self.bytes.as_ref()[1..], self.bands_length())
+    }
+
+    /// Iterate over the PHY Type Descriptors.
+    #[inline]
+    pub fn phy_type_descriptors(&self) -> PhyTypeDescriptorIter<'_> {
+        PhyTypeDescriptorIter {
+            buf: &self.bytes.as_ref()[1 + self.bands_length()..],
+            offset: 0,
+            bands_length: self.bands_length(),
+        }
+    }
+}
+
+/// Reads a little-endian band bitmap of `len` (2 or 4) bytes.
+#[inline]
+fn read_bands(b: &[u8], len: usize) -> u32 {
+    if len == 4 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u16::from_le_bytes([b[0], b[1]]) as u32
+    }
+}
+
+/// A PHY Type Descriptor of a SUN Device Capabilities IE.
+///
+/// Format (IEEE 802.15.4-2020, figure 7-64, little-endian):
+/// - Bits 0-3: PHY Type (table 7-23)
+/// - Bit 4: All Frequency Bands
+/// - Bits 5-15: PHY Modes Supported, bit n for PHY Mode ID n
+/// - Followed by Specific Frequency Bands (2 or 4 bytes, as the IE's band
+///   bitmap) if All Frequency Bands is zero
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhyTypeDescriptor {
+    pub phy_type: u8,
+    pub phy_modes_supported: u16,
+    /// `None` if the PHY type is supported in all of the IE's frequency bands.
+    pub specific_frequency_bands: Option<u32>,
+}
+
+/// Iterator over the PHY Type Descriptors of a SUN Device Capabilities IE.
+///
+/// Stops at the first descriptor that does not fit; [`Self::remaining()`]
+/// then returns the bytes that were not read.
+pub struct PhyTypeDescriptorIter<'a> {
+    buf: &'a [u8],
+    offset: usize,
+    bands_length: usize,
+}
+
+impl<'a> PhyTypeDescriptorIter<'a> {
+    /// Remaining bytes after current position.
+    #[inline]
+    pub fn remaining(&self) -> &'a [u8] {
+        &self.buf[self.offset..]
+    }
+}
+
+impl Iterator for PhyTypeDescriptorIter<'_> {
+    type Item = PhyTypeDescriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let b = self.remaining();
+        if b.len() < 2 {
+            return None;
+        }
+        let raw = u16::from_le_bytes([b[0], b[1]]);
+        let all_frequency_bands = raw & 0x0010 != 0;
+        let length = if all_frequency_bands {
+            2
+        } else {
+            2 + self.bands_length
+        };
+        if b.len() < length {
+            return None;
+        }
+        let specific_frequency_bands = if all_frequency_bands {
+            None
+        } else {
+            Some(read_bands(&b[2..], self.bands_length))
+        };
+        self.offset += length;
+        Some(PhyTypeDescriptor {
+            phy_type: (raw & 0x000f) as u8,
+            phy_modes_supported: raw >> 5,
+            specific_frequency_bands,
+        })
+    }
+}
+
+/// Vendor Specific Nested IE content (Long format, variable length).
+///
+/// Format (IEEE 802.15.4-2020, section 7.4.4.30, figure 7-101):
+/// - Bytes 0-2: Vendor OUI
+/// - Remaining bytes: Vendor Specific Information
+#[derive(Clone, Copy)]
+pub struct VendorSpecificNestedIe<Bytes> {
+    bytes: Bytes,
+}
+
+impl<Bytes: AsRef<[u8]>> VendorSpecificNestedIe<Bytes> {
+    pub const MIN_LENGTH: usize = 3;
+
+    #[inline]
+    pub fn new(bytes: Bytes) -> Option<Self> {
+        if bytes.as_ref().len() < Self::MIN_LENGTH {
+            return None;
+        }
+        Some(Self { bytes })
+    }
+
+    #[inline]
+    pub const fn new_unchecked(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+
+    /// Vendor OUI, as written (for example AC-DE-64 is `[0xac, 0xde, 0x64]`).
+    ///
+    /// The OUI is sent from its rightmost octet to its leftmost (IEEE
+    /// 802.15.4-2020, section 4.5.2), so the bytes are reversed here.
+    #[inline]
+    pub fn vendor_oui(&self) -> [u8; 3] {
+        let b = self.bytes.as_ref();
+        [b[2], b[1], b[0]]
+    }
+
+    /// Vendor Specific Information field.
+    #[inline]
+    pub fn vendor_specific_information(&self) -> &[u8] {
+        &self.bytes.as_ref()[Self::MIN_LENGTH..]
+    }
+}
+
 /// Link descriptor within TSCH Slotframe and Link IE (5 bytes).
 #[derive(Clone, Copy)]
 pub struct LinkDescriptor<Bytes> {
@@ -1017,6 +1259,30 @@ impl<'a> NestedIe<'a> {
         }
     }
 
+    /// Try to interpret as SUN Device Capabilities IE.
+    #[inline]
+    pub fn as_sun_device_capabilities(&self) -> Option<SunDeviceCapabilitiesIe<&'a [u8]>> {
+        match self {
+            NestedIe::Short { sub_id, content }
+                if *sub_id == nested_ie_id::SUN_DEVICE_CAPABILITIES =>
+            {
+                SunDeviceCapabilitiesIe::new(content)
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to interpret as Vendor Specific Nested IE.
+    #[inline]
+    pub fn as_vendor_specific(&self) -> Option<VendorSpecificNestedIe<&'a [u8]>> {
+        match self {
+            NestedIe::Long { sub_id, content } if *sub_id == nested_ie_id::VENDOR_SPECIFIC => {
+                VendorSpecificNestedIe::new(content)
+            }
+            _ => None,
+        }
+    }
+
     /// Try to interpret as Channel Hopping IE.
     #[inline]
     pub fn as_channel_hopping(&self) -> Option<ChannelHoppingIe<&'a [u8]>> {
@@ -1187,6 +1453,183 @@ pub fn find_nested_ie_content_mut(ies_buf: &mut [u8], sub_id: u8) -> Option<&mut
 mod tests {
 
     use super::*;
+
+    // SUN Device Capabilities and Vendor Specific Nested IEs, built octet by
+    // octet from IEEE 802.15.4-2020, figures 7-62 to 7-64 and 7-101.
+
+    /// Mode switch; bands 4 (863 MHz) and 14 (866 MHz); FSK-B (PHY type 1)
+    /// modes 0 and 1 in all bands; OFDM option 2 (PHY type 6) modes 0 to 3
+    /// in band 4 only.
+    const SUN_CAPS: [u8; 9] = [
+        0x40, // SUN Features: Mode Switch
+        0x10, 0x40, // Frequency Bands Supported: bits 4 and 14
+        0x71, 0x00, // PHY type 1, All Frequency Bands, modes 0b11
+        0xe6, 0x01, // PHY type 6, modes 0b1111
+        0x10, 0x00, // Specific Frequency Bands: bit 4
+    ];
+
+    #[test]
+    fn test_sun_device_capabilities() {
+        let ie = SunDeviceCapabilitiesIe::new(&SUN_CAPS[..]).unwrap();
+        assert!(ie.mode_switch());
+        assert!(!ie.enh_ack());
+        assert!(!ie.data_whitening());
+        assert!(!ie.interleaving());
+        assert!(!ie.sfd_group_1());
+        assert!(!ie.nrnsc_fec());
+        assert!(!ie.rsc_fec());
+        assert!(!ie.extended_band_identifier());
+        assert_eq!(ie.frequency_bands_supported(), (1 << 4) | (1 << 14));
+
+        let mut descriptors = ie.phy_type_descriptors();
+        assert_eq!(
+            descriptors.next(),
+            Some(PhyTypeDescriptor {
+                phy_type: 1,
+                phy_modes_supported: 0b11,
+                specific_frequency_bands: None,
+            })
+        );
+        assert_eq!(
+            descriptors.next(),
+            Some(PhyTypeDescriptor {
+                phy_type: 6,
+                phy_modes_supported: 0b1111,
+                specific_frequency_bands: Some(1 << 4),
+            })
+        );
+        assert_eq!(descriptors.next(), None);
+        assert!(descriptors.remaining().is_empty());
+    }
+
+    #[test]
+    fn test_sun_device_capabilities_features() {
+        for i in 0..7 {
+            let buf = [1u8 << i, 0, 0];
+            let ie = SunDeviceCapabilitiesIe::new(&buf[..]).unwrap();
+            let features = [
+                ie.enh_ack(),
+                ie.data_whitening(),
+                ie.interleaving(),
+                ie.sfd_group_1(),
+                ie.nrnsc_fec(),
+                ie.rsc_fec(),
+                ie.mode_switch(),
+            ];
+            let mut expected = [false; 7];
+            expected[i] = true;
+            assert_eq!(features, expected);
+            assert!(!ie.extended_band_identifier());
+        }
+    }
+
+    #[test]
+    fn test_sun_device_capabilities_extended_bands() {
+        // Extended Band Identifier; band 24 (867 MHz); OFDM option 1 (PHY
+        // type 5) mode 3 in bands 4 and 24.
+        let buf = [
+            0x80, // SUN Features: Extended Band Identifier
+            0x00, 0x00, 0x00, 0x01, // Frequency Bands Supported: bit 24
+            0x05, 0x01, // PHY type 5, modes 0b1000
+            0x10, 0x00, 0x00, 0x01, // Specific Frequency Bands: bits 4 and 24
+        ];
+        let ie = SunDeviceCapabilitiesIe::new(&buf[..]).unwrap();
+        assert!(ie.extended_band_identifier());
+        assert_eq!(ie.frequency_bands_supported(), 1 << 24);
+        let mut descriptors = ie.phy_type_descriptors();
+        assert_eq!(
+            descriptors.next(),
+            Some(PhyTypeDescriptor {
+                phy_type: 5,
+                phy_modes_supported: 0b1000,
+                specific_frequency_bands: Some((1 << 4) | (1 << 24)),
+            })
+        );
+        assert_eq!(descriptors.next(), None);
+    }
+
+    #[test]
+    fn test_sun_device_capabilities_truncated() {
+        for len in 0..SUN_CAPS.len() {
+            let ie = SunDeviceCapabilitiesIe::new(&SUN_CAPS[..len]);
+            if len < 3 {
+                assert!(ie.is_none(), "{len}");
+                continue;
+            }
+            // Only whole descriptors are returned, and the rest is left over.
+            let ie = ie.unwrap();
+            let mut descriptors = ie.phy_type_descriptors();
+            let count = descriptors.by_ref().count();
+            let expected = match len {
+                3 | 4 => 0,
+                5..=8 => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(count, expected, "{len}");
+            assert_eq!(
+                descriptors.remaining().len(),
+                len - 3 - 2 * expected,
+                "{len}"
+            );
+        }
+
+        // An extended IE needs four bytes of band bitmap.
+        assert!(SunDeviceCapabilitiesIe::new(&[0x80, 0, 0, 0][..]).is_none());
+        assert!(SunDeviceCapabilitiesIe::new(&[0x80, 0, 0, 0, 0][..]).is_some());
+    }
+
+    #[test]
+    fn test_vendor_specific_nested() {
+        // OUI AC-DE-64 is sent rightmost octet first (section 4.5.2).
+        let buf = [0x64, 0xde, 0xac, 0x01, 0x02];
+        let ie = VendorSpecificNestedIe::new(&buf[..]).unwrap();
+        assert_eq!(ie.vendor_oui(), [0xac, 0xde, 0x64]);
+        assert_eq!(ie.vendor_specific_information(), &[0x01, 0x02]);
+
+        let ie = VendorSpecificNestedIe::new(&buf[..3]).unwrap();
+        assert!(ie.vendor_specific_information().is_empty());
+        assert!(VendorSpecificNestedIe::new(&buf[..2]).is_none());
+    }
+
+    #[test]
+    fn test_nested_ie_as_sun_device_capabilities_and_vendor_specific() {
+        // An MLME payload IE's content: the SUN Device Capabilities IE (short,
+        // sub-ID 0x22) and a Vendor Specific Nested IE (long, sub-ID 0x08).
+        let mut buf = [0u8; 2 + 9 + 2 + 5];
+        buf[..2].copy_from_slice(&[9, 0x22]);
+        buf[2..11].copy_from_slice(&SUN_CAPS);
+        buf[11..13].copy_from_slice(&(0xc000u16 | 5).to_le_bytes());
+        buf[13..].copy_from_slice(&[0x64, 0xde, 0xac, 0x01, 0x02]);
+
+        let mut ies = NestedIeIter::new(&buf);
+        let caps = ies.next().unwrap();
+        assert!(caps.as_vendor_specific().is_none());
+        assert_eq!(
+            caps.as_sun_device_capabilities()
+                .unwrap()
+                .frequency_bands_supported(),
+            (1 << 4) | (1 << 14)
+        );
+        let vendor = ies.next().unwrap();
+        assert!(vendor.as_sun_device_capabilities().is_none());
+        assert_eq!(
+            vendor.as_vendor_specific().unwrap().vendor_oui(),
+            [0xac, 0xde, 0x64]
+        );
+        assert!(ies.next().is_none());
+
+        // The same sub-IDs in the other format are different IEs.
+        let long_0x22 = NestedIe::Long {
+            sub_id: nested_ie_id::SUN_DEVICE_CAPABILITIES,
+            content: &SUN_CAPS,
+        };
+        assert!(long_0x22.as_sun_device_capabilities().is_none());
+        let short_0x08 = NestedIe::Short {
+            sub_id: nested_ie_id::VENDOR_SPECIFIC,
+            content: &buf[13..],
+        };
+        assert!(short_0x08.as_vendor_specific().is_none());
+    }
 
     #[test]
     fn test_link_descriptor() {

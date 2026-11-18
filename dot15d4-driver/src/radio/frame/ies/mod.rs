@@ -12,7 +12,8 @@ use self::header::{
 use self::nested::{
     find_nested_ie_content, find_nested_ie_content_range, nested_ie_id, ChannelHoppingIe,
     LinkDescriptor, NestedIeIter, NestedIeLongHeader, NestedIeShortHeader, SlotframeDescriptor,
-    TschSlotframeLinkIe, TschSyncIe, TschTimeslotIe,
+    SunDeviceCapabilitiesIe, TschSlotframeLinkIe, TschSyncIe, TschTimeslotIe,
+    VendorSpecificNestedIe,
 };
 use self::payload::{find_mlme_content_range, payload_ie_id, PayloadIeHeader};
 
@@ -123,6 +124,27 @@ impl<Bytes: AsRef<[u8]>> IesFields<Bytes> {
         let buf = self.bytes.as_ref();
         let content = find_nested_ie_content(buf, nested_ie_id::CHANNEL_HOPPING, true)?;
         ChannelHoppingIe::new(content)
+    }
+
+    /// Find SUN Device Capabilities Nested IE.
+    #[inline]
+    pub fn sun_device_capabilities(&self) -> Option<SunDeviceCapabilitiesIe<&[u8]>> {
+        let buf = self.bytes.as_ref();
+        let content = find_nested_ie_content(buf, nested_ie_id::SUN_DEVICE_CAPABILITIES, false)?;
+        SunDeviceCapabilitiesIe::new(content)
+    }
+
+    /// Find the first Vendor Specific Nested IE.
+    ///
+    /// Use [`Self::nested_ies()`] and [`NestedIe::as_vendor_specific()`] to
+    /// visit all of them.
+    ///
+    /// [`NestedIe::as_vendor_specific()`]: nested::NestedIe::as_vendor_specific
+    #[inline]
+    pub fn vendor_specific_nested(&self) -> Option<VendorSpecificNestedIe<&[u8]>> {
+        let buf = self.bytes.as_ref();
+        let content = find_nested_ie_content(buf, nested_ie_id::VENDOR_SPECIFIC, true)?;
+        VendorSpecificNestedIe::new(content)
     }
 }
 
@@ -779,6 +801,39 @@ mod tests {
         let sync = ie_fields.tsch_sync().unwrap();
         assert_eq!(sync.asn(), 0x0102030405);
         assert_eq!(sync.join_metric(), 7);
+    }
+
+    #[test]
+    fn test_ie_fields_sun_device_capabilities_and_vendor_specific() {
+        // An Enhanced Beacon's IEs: HT1, then an MLME payload IE holding the
+        // SUN Device Capabilities IE and a Vendor Specific Nested IE (IEEE
+        // 802.15.4-2020, sections 7.4.4.10 and 7.4.4.30).
+        let frame = [
+            // Header IE: HT1 (id=0x7e, len=0)
+            0x00, 0x3F, // Payload IE: MLME (group=1, len=15)
+            0x0F, 0x88, // Nested IE: SUN Device Capabilities (short, id=0x22, len=7)
+            0x07, 0x22, 0x40, 0x10, 0x00, 0x71, 0x00, 0x11, 0x00,
+            // Nested IE: Vendor Specific (long, id=0x08, len=4)
+            0x04, 0xC0, 0x64, 0xDE, 0xAC, 0x2A,
+        ];
+
+        let ie_fields = IesFields::new(&frame[..]);
+
+        let caps = ie_fields.sun_device_capabilities().unwrap();
+        assert!(caps.mode_switch());
+        assert_eq!(caps.frequency_bands_supported(), 1 << 4);
+        let modes: u16 = caps
+            .phy_type_descriptors()
+            .map(|d| d.phy_modes_supported)
+            .fold(0, |a, m| a | m);
+        assert_eq!(modes, 0b11);
+        assert_eq!(caps.phy_type_descriptors().count(), 2);
+
+        let vendor = ie_fields.vendor_specific_nested().unwrap();
+        assert_eq!(vendor.vendor_oui(), [0xAC, 0xDE, 0x64]);
+        assert_eq!(vendor.vendor_specific_information(), &[0x2A]);
+
+        assert_eq!(ie_fields.nested_ies().unwrap().count(), 2);
     }
 
     #[test]
