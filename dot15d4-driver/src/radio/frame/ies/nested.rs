@@ -2,6 +2,8 @@
 // IE Type Constants
 // ============================================================================
 
+use const_for::const_for;
+
 use super::payload::find_mlme_content_range;
 
 pub mod nested_ie_id {
@@ -708,11 +710,20 @@ impl<Bytes: AsRef<[u8]>> SunDeviceCapabilitiesIe<Bytes> {
     /// Length of a band bitmap in this IE: 2 or 4 bytes.
     #[inline]
     fn bands_length(&self) -> usize {
-        if self.extended_band_identifier() {
-            4
-        } else {
-            2
-        }
+        bands_length(self.extended_band_identifier())
+    }
+
+    /// Length of the content of a SUN Device Capabilities IE with the given
+    /// band bitmap length and PHY Type Descriptors.
+    pub const fn content_length(
+        extended_band_identifier: bool,
+        descriptors: &[PhyTypeDescriptor],
+    ) -> usize {
+        let mut len = 1 + bands_length(extended_band_identifier);
+        const_for!(i in 0..descriptors.len() => {
+            len += descriptors[i].length(extended_band_identifier);
+        });
+        len
     }
 
     /// Frequency Bands Supported: bit n is set if frequency band identifier n
@@ -731,6 +742,76 @@ impl<Bytes: AsRef<[u8]>> SunDeviceCapabilitiesIe<Bytes> {
             bands_length: self.bands_length(),
         }
     }
+}
+
+impl<Bytes: AsRef<[u8]> + AsMut<[u8]>> SunDeviceCapabilitiesIe<Bytes> {
+    /// Set the SUN Features field, except the Extended Band Identifier bit.
+    ///
+    /// That bit sets the length of the band bitmaps, and so the IE's layout:
+    /// it's written from the IE's [`IeRepr`](super::IeRepr), or by
+    /// [`Self::set_extended_band_identifier()`].
+    #[inline]
+    pub fn set_sun_features(&mut self, features: u8) {
+        let b = self.bytes.as_mut();
+        b[0] = (b[0] & sun_features::EXTENDED_BAND_IDENTIFIER)
+            | (features & !sun_features::EXTENDED_BAND_IDENTIFIER);
+    }
+
+    /// Set the Extended Band Identifier bit: band bitmaps of 4 bytes instead
+    /// of 2. Set it before the fields that follow.
+    #[inline]
+    pub fn set_extended_band_identifier(&mut self, extended: bool) {
+        let b = self.bytes.as_mut();
+        if extended {
+            b[0] |= sun_features::EXTENDED_BAND_IDENTIFIER;
+        } else {
+            b[0] &= !sun_features::EXTENDED_BAND_IDENTIFIER;
+        }
+    }
+
+    /// Set Frequency Bands Supported. Without the Extended Band Identifier
+    /// bit, only bands 0 to 15 can be set.
+    #[inline]
+    pub fn set_frequency_bands_supported(&mut self, bands: u32) {
+        let len = self.bands_length();
+        let b = self.bytes.as_mut();
+        if b.len() > len {
+            write_bands(&mut b[1..], len, bands);
+        }
+    }
+
+    /// Set the PHY Type Descriptors, after the band bitmap. Nothing is
+    /// written unless all of them fit.
+    #[inline]
+    pub fn set_phy_type_descriptors(&mut self, descriptors: &[PhyTypeDescriptor]) {
+        let extended = self.extended_band_identifier();
+        let len = bands_length(extended);
+        let b = self.bytes.as_mut();
+        if b.len() < Self::content_length(extended, descriptors) {
+            return;
+        }
+        let mut offset = 1 + len;
+        for d in descriptors {
+            offset += d.write(&mut b[offset..], extended);
+        }
+    }
+}
+
+/// Length of a band bitmap: 2 or 4 bytes.
+#[inline]
+const fn bands_length(extended_band_identifier: bool) -> usize {
+    if extended_band_identifier {
+        4
+    } else {
+        2
+    }
+}
+
+/// Writes a little-endian band bitmap of `len` (2 or 4) bytes.
+#[inline]
+fn write_bands(b: &mut [u8], len: usize, bands: u32) {
+    debug_assert!(len == 4 || bands <= u16::MAX as u32);
+    b[..len].copy_from_slice(&bands.to_le_bytes()[..len]);
 }
 
 /// Reads a little-endian band bitmap of `len` (2 or 4) bytes.
@@ -757,6 +838,35 @@ pub struct PhyTypeDescriptor {
     pub phy_modes_supported: u16,
     /// `None` if the PHY type is supported in all of the IE's frequency bands.
     pub specific_frequency_bands: Option<u32>,
+}
+
+impl PhyTypeDescriptor {
+    /// Length of this descriptor in an IE with the given band bitmap length.
+    pub const fn length(&self, extended_band_identifier: bool) -> usize {
+        if self.specific_frequency_bands.is_some() {
+            2 + bands_length(extended_band_identifier)
+        } else {
+            2
+        }
+    }
+
+    /// Writes this descriptor at the start of `b`, which must hold
+    /// [`Self::length()`] bytes. Returns that length.
+    fn write(&self, b: &mut [u8], extended_band_identifier: bool) -> usize {
+        debug_assert!(self.phy_type <= 0x0f && self.phy_modes_supported <= 0x07ff);
+        let all_frequency_bands = if self.specific_frequency_bands.is_none() {
+            0x0010
+        } else {
+            0
+        };
+        let raw =
+            (self.phy_type as u16 & 0x000f) | all_frequency_bands | (self.phy_modes_supported << 5);
+        b[..2].copy_from_slice(&raw.to_le_bytes());
+        if let Some(bands) = self.specific_frequency_bands {
+            write_bands(&mut b[2..], bands_length(extended_band_identifier), bands);
+        }
+        self.length(extended_band_identifier)
+    }
 }
 
 /// Iterator over the PHY Type Descriptors of a SUN Device Capabilities IE.
@@ -849,6 +959,32 @@ impl<Bytes: AsRef<[u8]>> VendorSpecificNestedIe<Bytes> {
     #[inline]
     pub fn vendor_specific_information(&self) -> &[u8] {
         &self.bytes.as_ref()[Self::MIN_LENGTH..]
+    }
+}
+
+impl<Bytes: AsRef<[u8]> + AsMut<[u8]>> VendorSpecificNestedIe<Bytes> {
+    /// Set the Vendor OUI, as written (for example AC-DE-64 is
+    /// `[0xac, 0xde, 0x64]`); it's sent in reverse (section 4.5.2).
+    #[inline]
+    pub fn set_vendor_oui(&mut self, oui: [u8; 3]) {
+        let b = self.bytes.as_mut();
+        b[..3].copy_from_slice(&[oui[2], oui[1], oui[0]]);
+    }
+
+    /// Mutable Vendor Specific Information field.
+    #[inline]
+    pub fn vendor_specific_information_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes.as_mut()[Self::MIN_LENGTH..]
+    }
+
+    /// Set the Vendor Specific Information field. Nothing is written unless
+    /// `information` is as long as the field.
+    #[inline]
+    pub fn set_vendor_specific_information(&mut self, information: &[u8]) {
+        let field = self.vendor_specific_information_mut();
+        if field.len() == information.len() {
+            field.copy_from_slice(information);
+        }
     }
 }
 
@@ -1589,6 +1725,102 @@ mod tests {
         let ie = VendorSpecificNestedIe::new(&buf[..3]).unwrap();
         assert!(ie.vendor_specific_information().is_empty());
         assert!(VendorSpecificNestedIe::new(&buf[..2]).is_none());
+    }
+
+    /// [`SUN_CAPS`]'s PHY Type Descriptors.
+    const SUN_CAPS_DESCRIPTORS: [PhyTypeDescriptor; 2] = [
+        PhyTypeDescriptor {
+            phy_type: 1,
+            phy_modes_supported: 0b11,
+            specific_frequency_bands: None,
+        },
+        PhyTypeDescriptor {
+            phy_type: 6,
+            phy_modes_supported: 0b1111,
+            specific_frequency_bands: Some(1 << 4),
+        },
+    ];
+
+    #[test]
+    fn test_sun_device_capabilities_write() {
+        assert_eq!(
+            SunDeviceCapabilitiesIe::<&[u8]>::content_length(false, &SUN_CAPS_DESCRIPTORS),
+            SUN_CAPS.len()
+        );
+
+        let mut buf = [0u8; 9];
+        let mut ie = SunDeviceCapabilitiesIe::new_unchecked(&mut buf[..]);
+        ie.set_sun_features(sun_features::MODE_SWITCH);
+        ie.set_frequency_bands_supported((1 << 4) | (1 << 14));
+        ie.set_phy_type_descriptors(&SUN_CAPS_DESCRIPTORS);
+        assert_eq!(buf, SUN_CAPS);
+    }
+
+    #[test]
+    fn test_sun_device_capabilities_write_extended_bands() {
+        // As in test_sun_device_capabilities_extended_bands.
+        let descriptors = [PhyTypeDescriptor {
+            phy_type: 5,
+            phy_modes_supported: 0b1000,
+            specific_frequency_bands: Some((1 << 4) | (1 << 24)),
+        }];
+        assert_eq!(
+            SunDeviceCapabilitiesIe::<&[u8]>::content_length(true, &descriptors),
+            11
+        );
+
+        let mut buf = [0u8; 11];
+        let mut ie = SunDeviceCapabilitiesIe::new_unchecked(&mut buf[..]);
+        ie.set_extended_band_identifier(true);
+        // The SUN Features setter leaves the Extended Band Identifier alone.
+        ie.set_sun_features(0);
+        assert!(ie.extended_band_identifier());
+        ie.set_frequency_bands_supported(1 << 24);
+        ie.set_phy_type_descriptors(&descriptors);
+        assert_eq!(
+            buf,
+            [
+                0x80, // SUN Features: Extended Band Identifier
+                0x00, 0x00, 0x00, 0x01, // Frequency Bands Supported: bit 24
+                0x05, 0x01, // PHY type 5, modes 0b1000
+                0x10, 0x00, 0x00, 0x01, // Specific Frequency Bands: bits 4 and 24
+            ]
+        );
+
+        let mut ie = SunDeviceCapabilitiesIe::new_unchecked(&mut buf[..]);
+        ie.set_extended_band_identifier(false);
+        ie.set_sun_features(0xff);
+        assert_eq!(buf[0], 0x7f);
+    }
+
+    #[test]
+    fn test_sun_device_capabilities_write_too_short() {
+        // The descriptors are written whole or not at all.
+        let mut buf = [0u8; 8];
+        let mut ie = SunDeviceCapabilitiesIe::new_unchecked(&mut buf[..]);
+        ie.set_phy_type_descriptors(&SUN_CAPS_DESCRIPTORS);
+        assert_eq!(buf, [0; 8]);
+
+        // A band bitmap that doesn't fit isn't written.
+        let mut buf = [0x80, 0, 0, 0];
+        let mut ie = SunDeviceCapabilitiesIe::new_unchecked(&mut buf[..]);
+        ie.set_frequency_bands_supported(u32::MAX);
+        assert_eq!(buf, [0x80, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_vendor_specific_nested_write() {
+        let mut buf = [0u8; 5];
+        let mut ie = VendorSpecificNestedIe::new(&mut buf[..]).unwrap();
+        ie.set_vendor_oui([0xac, 0xde, 0x64]);
+        ie.set_vendor_specific_information(&[0x01, 0x02]);
+        assert_eq!(buf, [0x64, 0xde, 0xac, 0x01, 0x02]);
+
+        // Information of another length isn't written.
+        let mut ie = VendorSpecificNestedIe::new(&mut buf[..]).unwrap();
+        ie.set_vendor_specific_information(&[0x03]);
+        ie.vendor_specific_information_mut()[1] = 0x04;
+        assert_eq!(buf, [0x64, 0xde, 0xac, 0x01, 0x04]);
     }
 
     #[test]

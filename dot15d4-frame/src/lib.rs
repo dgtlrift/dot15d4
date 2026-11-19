@@ -447,6 +447,110 @@ mod test {
     }
 
     #[test]
+    fn test_enhanced_beacon_with_sun_device_capabilities() {
+        use dot15d4_driver::radio::frame::nested::{sun_features, PhyTypeDescriptor};
+
+        // An Enhanced Beacon (section 7.3.1) from a SUN device (section
+        // 7.4.4.10): FSK-B (PHY type 1) modes 7 and 8 and OFDM option 4 (PHY
+        // type 8) MCS 3, in all bands, of which 4 (863 MHz) is supported.
+        static DESCRIPTORS: [PhyTypeDescriptor; 2] = [
+            PhyTypeDescriptor {
+                phy_type: 1,
+                phy_modes_supported: 0x180,
+                specific_frequency_bands: None,
+            },
+            PhyTypeDescriptor {
+                phy_type: 8,
+                phy_modes_supported: 0x08,
+                specific_frequency_bands: None,
+            },
+        ];
+        static IES: [IeRepr; 1] = [IeRepr::SunDeviceCapabilitiesNestedIe(false, &DESCRIPTORS)];
+        const MPDU_REPR: MpduRepr<'static, MpduWithIes> = MpduRepr::new()
+            .with_frame_control(SeqNrRepr::Yes)
+            .with_addressing(AddressingRepr::new(
+                AddressingMode::Absent,
+                AddressingMode::Extended,
+                false,
+                PanIdCompressionRepr::No,
+            ))
+            .without_security()
+            .with_ies(IeListRepr::WithoutTerminationIes(IeReprList::new(&IES)));
+
+        const FRAME_REPR: RadioFrameRepr<FakeDriverConfig, RadioFrameUnsized> =
+            RadioFrameRepr::<_, RadioFrameUnsized>::new();
+        const MAX_BUFFER_LENGTH: usize = FRAME_REPR.max_buffer_length() as usize;
+
+        static BUFFER: ConstStaticCell<[u8; MAX_BUFFER_LENGTH]> =
+            ConstStaticCell::new([0; MAX_BUFFER_LENGTH]);
+        let buffer = BufferToken::new(BUFFER.take());
+
+        let mut mpdu_writer = MPDU_REPR
+            .into_writer::<FakeDriverConfig>(FrameVersion::Ieee802154, FrameType::Beacon, 0, buffer)
+            .unwrap();
+        mpdu_writer.set_sequence_number(9);
+        const SRC: [u8; 8] = [0x02, 0, 0, 0, 0, 0, 0, 0x02];
+        const PAN_ID: [u8; 2] = [0x34, 0x12];
+        {
+            let mut addressing = mpdu_writer.addressing_fields_mut();
+            addressing
+                .src_address_mut()
+                .set(&Address::Extended(ExtendedAddress::new_owned(SRC)));
+            addressing.src_pan_id_mut().set(&PanId::new_owned(PAN_ID));
+        }
+        {
+            let mut ies = mpdu_writer.ies_fields_mut();
+            let mut caps = ies.sun_device_capabilities_mut().unwrap();
+            caps.set_sun_features(sun_features::MODE_SWITCH);
+            caps.set_frequency_bands_supported(1 << 4);
+        }
+
+        const MPDU_LEN: usize = 26;
+        let expected: [u8; MPDU_LEN] = [
+            // Frame Control: Beacon, IE Present, no destination, frame version
+            // 0b10, extended source.
+            0x00, 0xE2, //
+            9,    // Sequence Number
+            0x34, 0x12, // Source PAN ID
+            0x02, 0, 0, 0, 0, 0, 0, 0x02, // Source Address
+            0x00, 0x3F, // Header IE: HT1 (id=0x7e, len=0)
+            0x09, 0x88, // Payload IE: MLME (group=1, len=9)
+            0x07, 0x22, // Nested IE: SUN Device Capabilities (short, id=0x22, len=7)
+            0x40, // SUN Features: Mode Switch
+            0x10, 0x00, // Frequency Bands Supported: bit 4
+            0x11, 0x30, // PHY type 1, All Frequency Bands, modes 0x180
+            0x18, 0x01, // PHY type 8, All Frequency Bands, modes 0x08
+        ];
+        let frame_buffer = mpdu_writer.into_buffer();
+        let headroom = FakeDriverConfig::HEADROOM as usize;
+        assert_eq!(
+            &frame_buffer.as_ref()[headroom..headroom + MPDU_LEN],
+            &expected
+        );
+
+        // Read it back.
+        let radio_frame = RadioFrame::new::<FakeDriverConfig>(frame_buffer)
+            .with_size(NonZeroU16::new(MPDU_LEN as u16).unwrap());
+        let reader = MpduFrame::from_radio_frame(radio_frame)
+            .into_parser()
+            .parse_addressing()
+            .unwrap()
+            .parse_security()
+            .unwrap()
+            .parse_ies::<FakeDriverConfig>()
+            .unwrap();
+        let ies = reader.try_ies_fields().unwrap();
+        let caps = ies.sun_device_capabilities().unwrap();
+        assert!(caps.mode_switch());
+        assert_eq!(caps.frequency_bands_supported(), 1 << 4);
+        assert!(caps.phy_type_descriptors().eq(DESCRIPTORS));
+
+        unsafe {
+            reader.into_buffer().consume();
+        }
+    }
+
+    #[test]
     fn test_mac_command_frame_version_0b10_addressing() {
         use crate::mpdu::{
             ASSOCIATE_REQUEST_FRAME_REPR, ASSOCIATE_RESPONSE_FRAME_REPR,

@@ -11,8 +11,8 @@ use self::header::{
 };
 use self::nested::{
     find_nested_ie_content, find_nested_ie_content_range, nested_ie_id, ChannelHoppingIe,
-    LinkDescriptor, NestedIeIter, NestedIeLongHeader, NestedIeShortHeader, SlotframeDescriptor,
-    SunDeviceCapabilitiesIe, TschSlotframeLinkIe, TschSyncIe, TschTimeslotIe,
+    LinkDescriptor, NestedIeIter, NestedIeLongHeader, NestedIeShortHeader, PhyTypeDescriptor,
+    SlotframeDescriptor, SunDeviceCapabilitiesIe, TschSlotframeLinkIe, TschSyncIe, TschTimeslotIe,
     VendorSpecificNestedIe,
 };
 use self::payload::{find_mlme_content_range, payload_ie_id, PayloadIeHeader};
@@ -203,6 +203,26 @@ impl<Bytes: AsRef<[u8]> + AsMut<[u8]>> IesFields<Bytes> {
         };
         ChannelHoppingIe::new(&mut self.bytes.as_mut()[start..end])
     }
+
+    /// Get mutable SUN Device Capabilities IE.
+    #[inline]
+    pub fn sun_device_capabilities_mut(&mut self) -> Option<SunDeviceCapabilitiesIe<&mut [u8]>> {
+        let (start, end) = {
+            let buf = self.bytes.as_ref();
+            find_nested_ie_content_range(buf, nested_ie_id::SUN_DEVICE_CAPABILITIES, false)?
+        };
+        SunDeviceCapabilitiesIe::new(&mut self.bytes.as_mut()[start..end])
+    }
+
+    /// Get the first mutable Vendor Specific Nested IE.
+    #[inline]
+    pub fn vendor_specific_nested_mut(&mut self) -> Option<VendorSpecificNestedIe<&mut [u8]>> {
+        let (start, end) = {
+            let buf = self.bytes.as_ref();
+            find_nested_ie_content_range(buf, nested_ie_id::VENDOR_SPECIFIC, true)?
+        };
+        VendorSpecificNestedIe::new(&mut self.bytes.as_mut()[start..end])
+    }
 }
 
 /// Initialize IE headers in a buffer based on IeRepr list.
@@ -334,6 +354,35 @@ pub fn init_ie_headers(buf: &mut [u8], ies: &[IeRepr<'_>], has_frame_payload: bo
                         offset += 2 + content_len as usize;
                     }
                 }
+                IeRepr::SunDeviceCapabilitiesNestedIe(extended_band_identifier, descriptors) => {
+                    let (_, nested_len) = ie.length();
+                    let content_len = (nested_len - 2) as usize;
+                    if offset + 2 + content_len <= buf.len() {
+                        let mut header =
+                            NestedIeShortHeader::new_unchecked(&mut buf[offset..offset + 2]);
+                        header.init(nested_ie_id::SUN_DEVICE_CAPABILITIES, content_len as u8);
+
+                        // Initialize the layout: the band bitmap length and
+                        // the PHY Type Descriptors.
+                        let content = &mut buf[offset + 2..offset + 2 + content_len];
+                        content.fill(0);
+                        let mut caps = SunDeviceCapabilitiesIe::new_unchecked(content);
+                        caps.set_extended_band_identifier(*extended_band_identifier);
+                        caps.set_phy_type_descriptors(descriptors);
+
+                        offset += 2 + content_len;
+                    }
+                }
+                IeRepr::VendorSpecificNestedIe(_information_len) => {
+                    let (_, nested_len) = ie.length();
+                    let content_len = nested_len - 2;
+                    if offset + 2 <= buf.len() {
+                        let mut header =
+                            NestedIeLongHeader::new_unchecked(&mut buf[offset..offset + 2]);
+                        header.init(nested_ie_id::VENDOR_SPECIFIC, content_len);
+                        offset += 2 + content_len as usize;
+                    }
+                }
                 _ => {} // Header IEs already handled
             }
         }
@@ -422,6 +471,14 @@ pub enum IeRepr<'ie> {
     TschSlotframeAndLinkNestedIe(&'ie [u8]), // for each slotframe descriptor: number of links
     ReducedTschTimeslotNestedIe,
     FullTschTimeslotNestedIe,
+    /// The SUN Device Capabilities IE (section 7.4.4.10): whether its band
+    /// bitmaps are extended (4 bytes), and its PHY Type Descriptors. They're
+    /// written with the IE's header; the SUN Features and Frequency Bands
+    /// Supported fields are left to the caller.
+    SunDeviceCapabilitiesNestedIe(bool, &'ie [PhyTypeDescriptor]),
+    /// A Vendor Specific Nested IE (section 7.4.4.30) with Vendor Specific
+    /// Information of the given length.
+    VendorSpecificNestedIe(u16),
 } // 12 bytes
   // TODO: Consider removing IEs based on the supported protocol to reduce size to
   //       1 byte for protocols that don't require parameterized IE config.
@@ -462,6 +519,17 @@ impl IeRepr<'_> {
             }
             IeRepr::ReducedTschTimeslotNestedIe => (0, 1),
             IeRepr::FullTschTimeslotNestedIe => (0, 25),
+            IeRepr::SunDeviceCapabilitiesNestedIe(extended_band_identifier, descriptors) => (
+                0,
+                SunDeviceCapabilitiesIe::<&[u8]>::content_length(
+                    *extended_band_identifier,
+                    descriptors,
+                ) as u16,
+            ),
+            IeRepr::VendorSpecificNestedIe(information_len) => (
+                0,
+                VendorSpecificNestedIe::<&[u8]>::MIN_LENGTH as u16 + *information_len,
+            ),
         };
 
         if header_ie_content_len > 0 {
@@ -810,6 +878,56 @@ mod tests {
         assert_eq!(vendor.vendor_specific_information(), &[0x2A]);
 
         assert_eq!(ie_fields.nested_ies().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn test_init_ie_headers_sun_device_capabilities_and_vendor_specific() {
+        // The IEs of test_ie_fields_sun_device_capabilities_and_vendor_specific.
+        let descriptors = [
+            PhyTypeDescriptor {
+                phy_type: 1,
+                phy_modes_supported: 0b11,
+                specific_frequency_bands: None,
+            },
+            PhyTypeDescriptor {
+                phy_type: 1,
+                phy_modes_supported: 0,
+                specific_frequency_bands: None,
+            },
+        ];
+        let ies = [
+            IeRepr::SunDeviceCapabilitiesNestedIe(false, &descriptors),
+            IeRepr::VendorSpecificNestedIe(1),
+        ];
+        assert_eq!(ies[0].length(), (0, 9));
+        assert_eq!(ies[1].length(), (0, 6));
+        assert_eq!(IeReprList::new(&ies).ies_length(false), 2 + 2 + 9 + 6);
+        // With a frame payload, a Payload Termination IE follows.
+        assert_eq!(IeReprList::new(&ies).ies_length(true), 2 + 2 + 9 + 6 + 2);
+
+        let mut buf = [0xffu8; 19];
+        let written = init_ie_headers(&mut buf, &ies, false);
+        assert_eq!(written, buf.len());
+
+        let mut ie_fields = IesFields::new(&mut buf[..]);
+        let mut caps = ie_fields.sun_device_capabilities_mut().unwrap();
+        caps.set_sun_features(nested::sun_features::MODE_SWITCH);
+        caps.set_frequency_bands_supported(1 << 4);
+        let mut vendor = ie_fields.vendor_specific_nested_mut().unwrap();
+        vendor.set_vendor_oui([0xAC, 0xDE, 0x64]);
+        vendor.set_vendor_specific_information(&[0x2A]);
+
+        assert_eq!(
+            buf,
+            [
+                // Header IE: HT1 (id=0x7e, len=0)
+                0x00, 0x3F, // Payload IE: MLME (group=1, len=15)
+                0x0F, 0x88, // Nested IE: SUN Device Capabilities (short, id=0x22, len=7)
+                0x07, 0x22, 0x40, 0x10, 0x00, 0x71, 0x00, 0x11, 0x00,
+                // Nested IE: Vendor Specific (long, id=0x08, len=4)
+                0x04, 0xC0, 0x64, 0xDE, 0xAC, 0x2A,
+            ]
+        );
     }
 
     #[test]
