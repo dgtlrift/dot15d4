@@ -6,8 +6,7 @@ use crate::timer::NsDuration;
 
 use super::constants::{A_MAX_SIFS_FRAME_SIZE, A_NUM_SUPERFRAME_SLOTS};
 
-#[allow(dead_code)]
-const PHY_MAX_PACKET_SIZE_2047: u16 = 2048; // SUN, TVWS, RCC, LECIM FSK, and MSK with a 2000 kb/s data rate
+const PHY_MAX_PACKET_SIZE_2047: u16 = 2047; // SUN, TVWS, RCC, LECIM FSK, and MSK with a 2000 kb/s data rate
 const PHY_MAX_PACKET_SIZE_127: u16 = 127; // all other PHYs
 
 /// PHY-dependent constants and PIB attributes.
@@ -200,26 +199,193 @@ impl PhyConfig for Phy<OQpsk250KBit> {
 const _: () =
     assert!(<Phy<OQpsk250KBit> as PhyConfig>::SymbolPeriods::from_ticks(1).to_micros() == 16);
 
-impl Ifs<Phy<OQpsk250KBit>> {
+impl<PhyImpl: PhyConfig> Ifs<PhyImpl> {
     pub const fn into_local_clock_duration(self) -> NsDuration {
         match self {
-            Ifs::Aifs(_) => <Phy<OQpsk250KBit> as PhyConfig>::AIFS,
-            Ifs::Sifs(_) => <Phy<OQpsk250KBit> as PhyConfig>::MAC_SIFS_PERIOD,
-            Ifs::Lifs(_) => <Phy<OQpsk250KBit> as PhyConfig>::MAC_LIFS_PERIOD,
+            Ifs::Aifs(_) => PhyImpl::AIFS,
+            Ifs::Sifs(_) => PhyImpl::MAC_SIFS_PERIOD,
+            Ifs::Lifs(_) => PhyImpl::MAC_LIFS_PERIOD,
             Ifs::Exact(spacing) => spacing,
         }
     }
 }
 
-impl From<Ifs<Phy<OQpsk250KBit>>> for NsDuration {
-    fn from(value: Ifs<Phy<OQpsk250KBit>>) -> Self {
+impl<PhyImpl: PhyConfig> From<Ifs<PhyImpl>> for NsDuration {
+    fn from(value: Ifs<PhyImpl>) -> Self {
         value.into_local_clock_duration()
     }
+}
+
+/// SUN FSK, 2-FSK at 50 ksymbol/s with a preamble of `PREAMBLE_OCTETS`
+/// octets (`phyFskPreambleLength`, 4 to 64; section 19.2.3.1).
+///
+/// This is operating mode #1 in the bands whose MAC and PHY timing use a
+/// 20 µs symbol period (IEEE 802.15.4-2020, Table 19-1), for example the
+/// 863-870 MHz band, where Wi-SUN calls it mode 1a.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SunFsk50KSym<const PREAMBLE_OCTETS: u16 = 8>;
+
+/// The SUN FSK symbol rate of operating mode #1 in the bands of Table 19-1
+/// with a 20 µs symbol period.
+const SUN_FSK_MODE_1_SYMBOL_RATE: u32 = 50_000;
+
+impl<const PREAMBLE_OCTETS: u16> SunFsk50KSym<PREAMBLE_OCTETS> {
+    /// SUN FSK PHY header length (section 19.2.4).
+    pub const PHY_HDR_LEN: usize = 2;
+
+    /// SFD length for 2-FSK (section 19.2.3.2).
+    pub const SFD_LEN: usize = 2;
+
+    // SHR duration: preamble and SFD, 8 symbols per octet.
+    pub const T_SHR: NsDuration = <Phy<Self> as PhyConfig>::SymbolPeriods::from_ticks(
+        (PREAMBLE_OCTETS as u64 + Self::SFD_LEN as u64) * 8,
+    )
+    .convert();
+
+    // PHR duration: two octets, 8 symbols each.
+    pub const T_PHR: NsDuration =
+        <Phy<Self> as PhyConfig>::SymbolPeriods::from_ticks(Self::PHY_HDR_LEN as u64 * 8).convert();
+}
+
+impl<const PREAMBLE_OCTETS: u16> PhyConfig for Phy<SunFsk50KSym<PREAMBLE_OCTETS>> {
+    const SYMBOL_RATE: u32 = SUN_FSK_MODE_1_SYMBOL_RATE;
+
+    /// 20 µs.
+    type SymbolPeriods = Duration<u64, 1, { SUN_FSK_MODE_1_SYMBOL_RATE }>;
+
+    // 1 ms, rounded up to whole symbol periods (Table 11-1).
+    const A_TURNAROUND_TIME: NsDuration = Self::SymbolPeriods::from_ticks(50).convert();
+
+    const PHY_MAX_PACKET_SIZE: u16 = PHY_MAX_PACKET_SIZE_2047;
+    // aCcaTime: 8 symbol periods (Table 11-1).
+    const PHY_CCA_DURATION: NsDuration = Self::SymbolPeriods::from_ticks(8).convert();
+
+    const A_BASE_SLOT_DURATION: NsDuration = Self::SymbolPeriods::from_ticks(60).convert();
+    const A_BASE_SUPERFRAME_DURATION: NsDuration =
+        Self::SymbolPeriods::from_ticks(60 * A_NUM_SUPERFRAME_SLOTS as u64).convert();
+    const A_MIN_CAP_LENGTH: NsDuration = Self::SymbolPeriods::from_ticks(440).convert();
+
+    // macFcsType's default: a 4-octet FCS.
+    const MAC_FCS_TYPE: u8 = 0;
+    const MAC_UNIT_BACKOFF_PERIOD: NsDuration = Self::A_TURNAROUND_TIME
+        .checked_add(Self::PHY_CCA_DURATION)
+        .unwrap();
+    // Section 10.1.4.
+    const MAC_SIFS_PERIOD: NsDuration = Self::SymbolPeriods::from_ticks(12).convert();
+    const MAC_LIFS_PERIOD: NsDuration = Self::SymbolPeriods::from_ticks(40).convert();
+    // 1 ms for the SUN PHYs (section 6.7.4.3).
+    const AIFS: NsDuration = NsDuration::millis(1);
+    const RMARKER_OFFSET: NsDuration = SunFsk50KSym::<PREAMBLE_OCTETS>::T_SHR;
+}
+
+/// SUN OFDM, any option and MCS, in the bands whose SUN FSK operating mode
+/// #1 has a 20 µs symbol period (IEEE 802.15.4-2020, Table 19-1).
+///
+/// Its symbol period is 120 µs (section 20.1), used for `aTurnaroundTime` and
+/// `aCcaTime`; SIFS and LIFS use the 20 µs symbol period of SUN FSK operating
+/// mode #1 instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SunOfdm;
+
+impl SunOfdm {
+    // SHR duration: the STF's four OFDM symbols (section 20.2.2.3) and the
+    // LTF's two, a half-symbol cyclic prefix and two base symbols
+    // (section 20.2.3.2).
+    pub const T_SHR: NsDuration =
+        <Phy<SunOfdm> as PhyConfig>::SymbolPeriods::from_ticks(6).convert();
+}
+
+impl PhyConfig for Phy<SunOfdm> {
+    /// 8-1/3 ksymbol/s, rounded down.
+    const SYMBOL_RATE: u32 = 8_333;
+
+    /// 120 µs.
+    type SymbolPeriods = Duration<u64, 3, 25_000>;
+
+    // 1 ms, rounded up to whole symbol periods (Table 11-1).
+    const A_TURNAROUND_TIME: NsDuration = Self::SymbolPeriods::from_ticks(9).convert();
+
+    const PHY_MAX_PACKET_SIZE: u16 = PHY_MAX_PACKET_SIZE_2047;
+    // aCcaTime: 8 symbol periods (Table 11-1).
+    const PHY_CCA_DURATION: NsDuration = Self::SymbolPeriods::from_ticks(8).convert();
+
+    const A_BASE_SLOT_DURATION: NsDuration = Self::SymbolPeriods::from_ticks(60).convert();
+    const A_BASE_SUPERFRAME_DURATION: NsDuration =
+        Self::SymbolPeriods::from_ticks(60 * A_NUM_SUPERFRAME_SLOTS as u64).convert();
+    const A_MIN_CAP_LENGTH: NsDuration = Self::SymbolPeriods::from_ticks(440).convert();
+
+    // macFcsType's default: a 4-octet FCS.
+    const MAC_FCS_TYPE: u8 = 0;
+    const MAC_UNIT_BACKOFF_PERIOD: NsDuration = Self::A_TURNAROUND_TIME
+        .checked_add(Self::PHY_CCA_DURATION)
+        .unwrap();
+    // SUN FSK operating mode #1's symbol period (section 20.1).
+    const MAC_SIFS_PERIOD: NsDuration = <Phy<SunFsk50KSym> as PhyConfig>::MAC_SIFS_PERIOD;
+    const MAC_LIFS_PERIOD: NsDuration = <Phy<SunFsk50KSym> as PhyConfig>::MAC_LIFS_PERIOD;
+    // 1 ms for the SUN PHYs (section 6.7.4.3).
+    const AIFS: NsDuration = NsDuration::millis(1);
+    const RMARKER_OFFSET: NsDuration = SunOfdm::T_SHR;
 }
 
 #[cfg(test)]
 mod ifs_tests {
     use super::*;
+
+    #[test]
+    fn sun_fsk_timing() {
+        type P = Phy<SunFsk50KSym>;
+        assert_eq!(
+            <P as PhyConfig>::SymbolPeriods::from_ticks(1).to_micros(),
+            20
+        );
+        assert_eq!(<P as PhyConfig>::A_TURNAROUND_TIME, NsDuration::millis(1));
+        assert_eq!(<P as PhyConfig>::PHY_CCA_DURATION, NsDuration::micros(160));
+        assert_eq!(
+            <P as PhyConfig>::MAC_UNIT_BACKOFF_PERIOD,
+            NsDuration::micros(1160)
+        );
+        assert_eq!(<P as PhyConfig>::MAC_SIFS_PERIOD, NsDuration::micros(240));
+        assert_eq!(<P as PhyConfig>::MAC_LIFS_PERIOD, NsDuration::micros(800));
+        assert_eq!(<P as PhyConfig>::PHY_MAX_PACKET_SIZE, 2047);
+        assert_eq!(P::fcs_length(), 4);
+        // An 8-octet preamble and a 2-octet SFD: 80 symbols.
+        assert_eq!(<P as PhyConfig>::RMARKER_OFFSET, NsDuration::micros(1600));
+        assert_eq!(SunFsk50KSym::<8>::T_PHR, NsDuration::micros(320));
+        assert_eq!(
+            <Phy<SunFsk50KSym<4>> as PhyConfig>::RMARKER_OFFSET,
+            NsDuration::micros(960)
+        );
+        assert_eq!(
+            Ifs::<P>::ack().into_local_clock_duration(),
+            NsDuration::millis(1)
+        );
+    }
+
+    #[test]
+    fn sun_ofdm_timing() {
+        type P = Phy<SunOfdm>;
+        assert_eq!(
+            <P as PhyConfig>::SymbolPeriods::from_ticks(1).to_micros(),
+            120
+        );
+        // 1 ms is 8-1/3 symbols, rounded up to 9.
+        assert_eq!(
+            <P as PhyConfig>::A_TURNAROUND_TIME,
+            NsDuration::micros(1080)
+        );
+        assert_eq!(<P as PhyConfig>::PHY_CCA_DURATION, NsDuration::micros(960));
+        assert_eq!(
+            <P as PhyConfig>::MAC_UNIT_BACKOFF_PERIOD,
+            NsDuration::micros(2040)
+        );
+        assert_eq!(<P as PhyConfig>::MAC_SIFS_PERIOD, NsDuration::micros(240));
+        assert_eq!(<P as PhyConfig>::MAC_LIFS_PERIOD, NsDuration::micros(800));
+        assert_eq!(<P as PhyConfig>::RMARKER_OFFSET, NsDuration::micros(720));
+        assert_eq!(
+            Ifs::<P>::long().into_local_clock_duration(),
+            NsDuration::micros(800)
+        );
+    }
 
     #[test]
     fn exact_spacing_is_passed_through() {
