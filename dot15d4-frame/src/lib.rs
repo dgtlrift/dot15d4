@@ -312,6 +312,154 @@ mod test {
         }
     }
 
+    /// Fills a data frame's sequence number, addressing fields and payload,
+    /// through either writer.
+    fn fill_data_frame<AnyMpdu: crate::mpdu::MpduBytesMut>(
+        w: &mut crate::fields::MpduParser<AnyMpdu, crate::MpduWithAllFields>,
+    ) {
+        w.set_sequence_number(0x5a);
+        w.set_ack_request(true);
+        w.set_frame_pending(true);
+        let mut addressing = w.addressing_fields_mut();
+        addressing
+            .dst_pan_id_mut()
+            .set(&PanId::new_owned([0xcd, 0xab]));
+        addressing
+            .dst_address_mut()
+            .set(&Address::Extended(ExtendedAddress::new_owned([
+                0x02, 0, 0, 0, 0, 0, 0, 0x02,
+            ])));
+        addressing.src_address_mut().set(&Address::Short(
+            dot15d4_driver::radio::frame::ShortAddress::new_owned([0x34, 0x12]),
+        ));
+        w.frame_payload_mut().copy_from_slice(b"abc");
+    }
+
+    #[test]
+    fn test_slice_writer_matches_token_writer() {
+        const MPDU_REPR: MpduRepr<'static, MpduWithIes> = MpduRepr::new()
+            .with_frame_control(SeqNrRepr::Yes)
+            .with_addressing(AddressingRepr::new_legacy_addressing(
+                AddressingMode::Extended,
+                AddressingMode::Short,
+                true,
+            ))
+            .without_security()
+            .without_ies();
+        const PAYLOAD_LENGTH: u16 = 3;
+        // Frame control, sequence number, PAN ID, extended destination, short
+        // source, payload.
+        const MPDU_LENGTH: usize = 2 + 1 + 2 + 8 + 2 + 3;
+
+        const FRAME_REPR: RadioFrameRepr<FakeDriverConfig, RadioFrameUnsized> =
+            RadioFrameRepr::<_, RadioFrameUnsized>::new();
+        const MAX_BUFFER_LENGTH: usize = FRAME_REPR.max_buffer_length() as usize;
+        static BUFFER: ConstStaticCell<[u8; MAX_BUFFER_LENGTH]> =
+            ConstStaticCell::new([0; MAX_BUFFER_LENGTH]);
+        let mut token_writer = MPDU_REPR
+            .into_writer::<FakeDriverConfig>(
+                FrameVersion::Ieee802154_2006,
+                FrameType::Data,
+                PAYLOAD_LENGTH,
+                BufferToken::new(BUFFER.take()),
+            )
+            .unwrap();
+        fill_data_frame(&mut token_writer);
+        let token = token_writer.into_buffer();
+        let headroom = FakeDriverConfig::HEADROOM as usize;
+        let expected: [u8; MPDU_LENGTH] =
+            token[headroom..headroom + MPDU_LENGTH].try_into().unwrap();
+
+        // The FCS's two bytes follow, left as they were.
+        let mut psdu = [0xffu8; MPDU_LENGTH + 2];
+        let mut slice_writer = MPDU_REPR
+            .into_slice_writer(
+                FrameVersion::Ieee802154_2006,
+                FrameType::Data,
+                PAYLOAD_LENGTH,
+                2,
+                &mut psdu,
+            )
+            .unwrap();
+        fill_data_frame(&mut slice_writer);
+        drop(slice_writer);
+        assert_eq!(psdu[..MPDU_LENGTH], expected);
+        assert_eq!(psdu[MPDU_LENGTH..], [0xff, 0xff]);
+        assert_eq!(&expected[..3], &[0x71, 0x9c, 0x5a]);
+
+        // It reads back.
+        let reader = crate::mpdu::MpduSlice::new(&psdu, 2)
+            .unwrap()
+            .reader()
+            .parse_addressing()
+            .unwrap()
+            .parse_security()
+            .unwrap()
+            .parse_ies_with_fcs_length(2)
+            .unwrap();
+        assert_eq!(reader.try_frame_payload(), Some(&b"abc"[..]));
+
+        unsafe {
+            token.consume();
+        }
+    }
+
+    #[test]
+    fn test_slice_writer_refuses() {
+        let repr: MpduRepr<'static, MpduWithIes> = MpduRepr::new()
+            .with_frame_control(SeqNrRepr::Yes)
+            .with_addressing(AddressingRepr::new_legacy_addressing(
+                AddressingMode::Short,
+                AddressingMode::Short,
+                true,
+            ))
+            .without_security()
+            .without_ies();
+        // 9 header bytes, 1 payload byte and a 2-byte FCS: 11 bytes are too few.
+        let mut short = [0u8; 11];
+        assert!(repr
+            .into_slice_writer(
+                FrameVersion::Ieee802154_2006,
+                FrameType::Data,
+                1,
+                2,
+                &mut short
+            )
+            .is_err());
+        let mut fits = [0u8; 12];
+        let w = repr
+            .into_slice_writer(
+                FrameVersion::Ieee802154_2006,
+                FrameType::Data,
+                1,
+                2,
+                &mut fits,
+            )
+            .unwrap();
+        assert_eq!(w.mpdu_length_wo_fcs(), 10);
+        drop(w);
+
+        // A suppressed sequence number with a legacy frame version.
+        let suppressed: MpduRepr<'static, MpduWithIes> = MpduRepr::new()
+            .with_frame_control(SeqNrRepr::No)
+            .with_addressing(AddressingRepr::new_legacy_addressing(
+                AddressingMode::Short,
+                AddressingMode::Short,
+                true,
+            ))
+            .without_security()
+            .without_ies();
+        assert!(suppressed
+            .into_slice_writer(
+                FrameVersion::Ieee802154_2006,
+                FrameType::Data,
+                1,
+                2,
+                &mut fits
+            )
+            .is_err());
+    }
+
     #[test]
     fn test_imm_ack_frame() {
         const IMM_ACK_LEN: u8 = 3;
