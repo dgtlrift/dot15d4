@@ -201,6 +201,22 @@ impl MpduFieldRanges<MpduWithSecurity> {
         self.next_state::<Config>(ies_length, frame_payload_length)
     }
 
+    /// As [`Self::with_ies_and_payload_length()`], with an FCS of
+    /// `fcs_length` bytes rather than the driver's.
+    #[cfg(feature = "ies")]
+    pub(crate) const fn with_ies_and_payload_and_fcs_length(
+        &self,
+        ies: IeListRepr,
+        frame_payload_length: u16,
+        fcs_length: u16,
+    ) -> MpduFieldRanges<MpduWithAllFields> {
+        let ies_length = match ies.ies_length(frame_payload_length > 0) {
+            Ok(len) => len,
+            Err(_) => panic!(),
+        };
+        self.next_state_with_fcs_length(ies_length, frame_payload_length, fcs_length)
+    }
+
     /// Call this method to configure information elements when the frame
     /// payload length must be derived from the overall length of the frame.
     /// This is usually the case when parsing incoming radio frames.
@@ -259,6 +275,16 @@ impl MpduFieldRanges<MpduWithSecurity> {
         frame_payload_length: u16,
     ) -> MpduFieldRanges<MpduWithAllFields> {
         self.next_state::<Config>(0, frame_payload_length)
+    }
+
+    /// As [`Self::without_ies_with_payload_length()`], with an FCS of
+    /// `fcs_length` bytes rather than the driver's.
+    pub(crate) const fn without_ies_with_payload_and_fcs_length(
+        &self,
+        frame_payload_length: u16,
+        fcs_length: u16,
+    ) -> MpduFieldRanges<MpduWithAllFields> {
+        self.next_state_with_fcs_length(0, frame_payload_length, fcs_length)
     }
 
     /// Call this method to finalize the frame without IEs when the frame

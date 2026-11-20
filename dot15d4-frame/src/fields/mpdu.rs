@@ -1,3 +1,5 @@
+use core::num::NonZero;
+
 use dot15d4_driver::radio::frame::compute_ies_length_from_buffer;
 #[cfg(feature = "ies")]
 use dot15d4_driver::radio::frame::IeListRepr;
@@ -17,7 +19,7 @@ use dot15d4_util::{
 };
 
 use crate::{
-    mpdu::{MpduBytes, MpduFrame},
+    mpdu::{MpduBytes, MpduBytesMut, MpduFrame, MpduSliceMut},
     repr::SeqNrRepr,
     MpduParsedUpToAddressing, MpduParsedUpToSecurity, MpduWithAddressing, MpduWithAllFields,
     MpduWithFrameControl, MpduWithSecurity,
@@ -223,9 +225,74 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
         // Note: The buffer may or may not be zeroed.
         buffer: BufferToken,
     ) -> Result<MpduParser<MpduFrame, MpduWithAllFields>, BufferToken> {
+        let Some(mpdu_length_wo_fcs) =
+            self.writable_mpdu_length(frame_version, frame_payload_length)
+        else {
+            return Err(buffer);
+        };
+
+        let radio_frame_repr = RadioFrameRepr::<Config, RadioFrameSized>::new(mpdu_length_wo_fcs);
+        let min_buffer_length = radio_frame_repr.pdu_length();
+        assert!(buffer.len() >= min_buffer_length as usize);
+
+        let offset_mpdu = radio_frame_repr.headroom_length();
+        // Safety: we already asserted that the buffer is large enough to hold the minimum
+        // calculated MPDU length.
+        let mpdu = unsafe { MpduFrame::new(buffer, offset_mpdu, mpdu_length_wo_fcs) };
+
+        Ok(self.init_writer(
+            mpdu,
+            offset_mpdu,
+            frame_version,
+            frame_type,
+            frame_payload_length,
+            size_of::<<Config as DriverConfig>::Fcs>() as u16,
+        ))
+    }
+
+    /// Initializes an MPDU writer over a byte slice based on this MPDU
+    /// representation, as [`Self::into_writer()`] does over a radio buffer.
+    ///
+    /// The MPDU starts at the slice's first byte and is followed by
+    /// `fcs_length` bytes (0, 2 or 4) for its FCS, which are left as they are
+    /// for the radio or the caller to fill.
+    ///
+    /// Fails if the representation is inconsistent with the frame version, or
+    /// if `buffer` can't hold the MPDU and its FCS.
+    pub fn into_slice_writer<'buf>(
+        &self,
+        frame_version: FrameVersion,
+        frame_type: FrameType,
+        frame_payload_length: u16,
+        fcs_length: u8,
+        // Note: The buffer may or may not be zeroed.
+        buffer: &'buf mut [u8],
+    ) -> SimplifiedResult<MpduParser<MpduSliceMut<'buf>, MpduWithAllFields>> {
+        let mpdu_length_wo_fcs = self
+            .writable_mpdu_length(frame_version, frame_payload_length)
+            .ok_or(Error)?;
+        let mpdu = MpduSliceMut::new(buffer, mpdu_length_wo_fcs, fcs_length).ok_or(Error)?;
+        Ok(self.init_writer(
+            mpdu,
+            0,
+            frame_version,
+            frame_type,
+            frame_payload_length,
+            fcs_length as u16,
+        ))
+    }
+
+    /// The length without its FCS of an MPDU built from this representation,
+    /// or [`None`] if the representation is inconsistent with the frame
+    /// version.
+    fn writable_mpdu_length(
+        &self,
+        frame_version: FrameVersion,
+        frame_payload_length: u16,
+    ) -> Option<NonZero<u16>> {
         // Reject reserved frame versions.
         if matches!(frame_version, FrameVersion::Unknown) {
-            return Err(buffer);
+            return None;
         }
 
         // For frame versions 0b00 and 0b01 the Sequence Number Suppression and
@@ -236,35 +303,35 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
             FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006
         ) {
             if matches!(self.seq_nr, SeqNrRepr::No) {
-                return Err(buffer);
+                return None;
             }
 
             #[cfg(feature = "ies")]
             if !self.ies.is_empty() {
-                return Err(buffer);
+                return None;
             }
         }
 
         if let Some(addressing) = &self.addressing {
             if !addressing.is_compatible_with_frame_version(frame_version) {
-                return Err(buffer);
+                return None;
             }
         }
 
-        let mpdu_length_wo_fcs = match self.mpdu_length_wo_fcs(frame_payload_length) {
-            Ok(mpdu_length_wo_fcs) => mpdu_length_wo_fcs,
-            Err(_) => return Err(buffer),
-        };
+        self.mpdu_length_wo_fcs(frame_payload_length).ok()
+    }
 
-        let radio_frame_repr = RadioFrameRepr::<Config, RadioFrameSized>::new(mpdu_length_wo_fcs);
-        let min_buffer_length = radio_frame_repr.pdu_length();
-        assert!(buffer.len() >= min_buffer_length as usize);
-
-        let offset_mpdu = radio_frame_repr.headroom_length();
-        // Safety: we already asserted that the buffer is large enough to hold the minimum
-        // calculated MPDU length.
-        let mut mpdu = unsafe { MpduFrame::new(buffer, offset_mpdu, mpdu_length_wo_fcs) };
-
+    /// Writes the frame's structure into `mpdu`, whose MPDU starts at
+    /// `offset_mpdu` and is followed by an FCS of `fcs_length` bytes.
+    fn init_writer<AnyMpdu: MpduBytesMut>(
+        &self,
+        mut mpdu: AnyMpdu,
+        offset_mpdu: u8,
+        frame_version: FrameVersion,
+        frame_type: FrameType,
+        frame_payload_length: u16,
+        fcs_length: u16,
+    ) -> MpduParser<AnyMpdu, MpduWithAllFields> {
         let (dst_addr_mode, src_addr_mode, pan_id_compression) = match &self.addressing {
             Some(addressing) => (
                 addressing.dst_addr_mode(),
@@ -285,9 +352,10 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
         let ie_present = false;
 
         // All frame control fields shall default to zero.
-        mpdu.frame_control_slice_mut().fill(0);
+        let offset = offset_mpdu as usize;
+        mpdu.mpdu_buffer_mut()[offset..offset + 2].fill(0);
 
-        let mut fc = mpdu.frame_control_mut();
+        let mut fc = mpdu.mpdu_frame_control_mut();
         fc.set_frame_version(frame_version);
         fc.set_frame_type(frame_type);
         fc.set_sequence_number_suppression(matches!(self.seq_nr, SeqNrRepr::No));
@@ -317,16 +385,18 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
         let mpdu_field_ranges = mpdu_field_ranges.without_security();
 
         #[cfg(feature = "ies")]
-        let mpdu_field_ranges =
-            match self.ies {
-                IeListRepr::Empty => mpdu_field_ranges
-                    .without_ies_with_payload_length::<Config>(frame_payload_length),
-                ies => mpdu_field_ranges
-                    .with_ies_and_payload_length::<Config>(ies, frame_payload_length),
-            };
+        let mpdu_field_ranges = match self.ies {
+            IeListRepr::Empty => mpdu_field_ranges
+                .without_ies_with_payload_and_fcs_length(frame_payload_length, fcs_length),
+            ies => mpdu_field_ranges.with_ies_and_payload_and_fcs_length(
+                ies,
+                frame_payload_length,
+                fcs_length,
+            ),
+        };
         #[cfg(not(feature = "ies"))]
-        let mpdu_field_ranges =
-            mpdu_field_ranges.without_ies_with_payload_length::<Config>(frame_payload_length);
+        let mpdu_field_ranges = mpdu_field_ranges
+            .without_ies_with_payload_and_fcs_length(frame_payload_length, fcs_length);
 
         #[cfg(feature = "ies")]
         {
@@ -336,7 +406,7 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
                 let ie_range = mpdu_field_ranges
                     .try_range_ies()
                     .expect("IEs should be present");
-                let ie_buf = &mut mpdu.buffer[ie_range];
+                let ie_buf = &mut mpdu.mpdu_buffer_mut()[ie_range];
                 let has_frame_payload = frame_payload_length > 0;
 
                 match &self.ies {
@@ -352,10 +422,10 @@ impl<'repr> MpduRepr<'repr, MpduWithIes> {
             }
         }
 
-        Ok(MpduParser {
+        MpduParser {
             mpdu_field_ranges,
             mpdu,
-        })
+        }
     }
 }
 
@@ -367,6 +437,11 @@ impl<ReadOnlyMpdu: MpduBytes, State> MpduParser<ReadOnlyMpdu, State> {
     ///       the frame may no longer be changed structurally at this stage.
     pub fn frame_control(&self) -> FrameControl<&[u8]> {
         self.mpdu.mpdu_frame_control()
+    }
+
+    /// See [`MpduBytes::mpdu_length_wo_fcs()`].
+    pub fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.mpdu.mpdu_length_wo_fcs()
     }
 
     /// See [`MpduBytes::mpdu_sequence_number()`].
@@ -388,20 +463,18 @@ impl<ReadOnlyMpdu: MpduBytes, State> MpduParser<ReadOnlyMpdu, State> {
 /// Note: Only parts of the frame control field that don't change the MPDU
 ///       structurally may be edited. All other fields must be initialized via
 ///       [`MpduRepr::into_writer()`].
-impl<WriteOnlyMpdu: AsMut<MpduFrame>, State> MpduParser<WriteOnlyMpdu, State> {
+impl<WriteOnlyMpdu: MpduBytesMut, State> MpduParser<WriteOnlyMpdu, State> {
     /// See [`FrameControl::set_ack_request()`]
     pub fn set_ack_request(&mut self, ack_request: bool) {
         self.mpdu
-            .as_mut()
-            .frame_control_mut()
+            .mpdu_frame_control_mut()
             .set_ack_request(ack_request);
     }
 
     /// See [`FrameControl::set_frame_pending()`]
     pub fn set_frame_pending(&mut self, frame_pending: bool) {
         self.mpdu
-            .as_mut()
-            .frame_control_mut()
+            .mpdu_frame_control_mut()
             .set_frame_pending(frame_pending);
     }
 
@@ -411,14 +484,17 @@ impl<WriteOnlyMpdu: AsMut<MpduFrame>, State> MpduParser<WriteOnlyMpdu, State> {
         //         control field when we instantiate the parsed MPDU. The
         //         following call checks the frame control field's sequence
         //         number suppression field.
-        self.mpdu.as_mut().try_set_sequence_number(seq_nr)
+        self.mpdu
+            .mpdu_try_set_sequence_number(seq_nr)
+            .map_err(|()| Error)
     }
 
     /// See [`MpduFrame::set_sequence_number()`].
     pub fn set_sequence_number(&mut self, seq_nr: u8) {
         // Safety: We synchronize the frame representation and the frame
         //         control field when we instantiate the parsed MPDU.
-        self.mpdu.as_mut().set_sequence_number(seq_nr);
+        let set = self.mpdu.mpdu_try_set_sequence_number(seq_nr);
+        debug_assert!(set.is_ok());
     }
 }
 
@@ -476,7 +552,7 @@ impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithFrameControl> {
 }
 
 /// MPDU writer at the initial frame-control parsing stage.
-impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, MpduWithFrameControl> {
+impl<ReadWriteMpdu: MpduBytesMut> MpduParser<ReadWriteMpdu, MpduWithFrameControl> {
     /// Parses the frame control field to identify the addressing configuration
     /// of the MPDU.
     pub fn parse_addressing_mut(
@@ -603,7 +679,7 @@ impl<ReadOnlyMpdu: MpduBytes, State: MpduParsedUpToAddressing> MpduParser<ReadOn
 
 /// Exposes writable fields accessible from an MPDU at the addressing
 /// parsing stage or beyond.
-impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>, State: MpduParsedUpToAddressing>
+impl<ReadWriteMpdu: MpduBytesMut, State: MpduParsedUpToAddressing>
     MpduParser<ReadWriteMpdu, State>
 {
     /// Writable addressing field access.
@@ -615,7 +691,7 @@ impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>, State: MpduParsedUpToAddressin
         let addressing_repr = AddressingRepr::try_from_frame_control(self.frame_control())?;
 
         AddressingFields::try_new(
-            &mut self.mpdu.as_mut().buffer[range_addressing],
+            &mut self.mpdu.mpdu_buffer_mut()[range_addressing],
             addressing_repr,
         )
     }
@@ -631,7 +707,7 @@ impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>, State: MpduParsedUpToAddressin
         let addressing_repr = AddressingRepr::try_from_frame_control(self.frame_control()).unwrap();
 
         AddressingFields::try_new(
-            &mut self.mpdu.as_mut().buffer[range_addressing],
+            &mut self.mpdu.mpdu_buffer_mut()[range_addressing],
             addressing_repr,
         )
         .unwrap()
@@ -688,7 +764,7 @@ impl<ReadOnlyMpdu: MpduBytes> MpduParser<ReadOnlyMpdu, MpduWithAllFields> {
 
 /// Exposes mutable IE field access from a fully parsed MPDU.
 #[cfg(feature = "ies")]
-impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, MpduWithAllFields> {
+impl<ReadWriteMpdu: MpduBytesMut> MpduParser<ReadWriteMpdu, MpduWithAllFields> {
     /// Returns mutable IE bytes slice.
     ///
     /// # Panics
@@ -699,14 +775,14 @@ impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, Mpdu
             .mpdu_field_ranges
             .try_range_ies()
             .expect("No IEs present in frame");
-        &mut self.mpdu.as_mut().buffer[range]
+        &mut self.mpdu.mpdu_buffer_mut()[range]
     }
 
     /// Returns mutable IE bytes slice, or `None` if no IEs present.
     #[inline]
     pub fn try_ies_slice_mut(&mut self) -> Option<&mut [u8]> {
         let range = self.mpdu_field_ranges.try_range_ies()?;
-        Some(&mut self.mpdu.as_mut().buffer[range])
+        Some(&mut self.mpdu.mpdu_buffer_mut()[range])
     }
 
     /// Returns a mutable `IeFields` accessor.
@@ -726,21 +802,21 @@ impl<ReadWriteMpdu: MpduBytes + AsMut<MpduFrame>> MpduParser<ReadWriteMpdu, Mpdu
 }
 
 /// Exposes write-only fields accessible from an MPDU once it is fully parsed.
-impl<WriteOnlyMpdu: AsMut<MpduFrame>> MpduParser<WriteOnlyMpdu, MpduWithAllFields> {
+impl<WriteOnlyMpdu: MpduBytesMut> MpduParser<WriteOnlyMpdu, MpduWithAllFields> {
     pub fn try_frame_payload_mut(&mut self) -> Option<&mut [u8]> {
-        Some(&mut self.mpdu.as_mut().buffer[self.mpdu_field_ranges.try_range_frame_payload()?])
+        Some(&mut self.mpdu.mpdu_buffer_mut()[self.mpdu_field_ranges.try_range_frame_payload()?])
     }
 
     pub fn frame_payload_mut(&mut self) -> &mut [u8] {
-        &mut self.mpdu.as_mut().buffer[self.mpdu_field_ranges.try_range_frame_payload().unwrap()]
+        &mut self.mpdu.mpdu_buffer_mut()[self.mpdu_field_ranges.try_range_frame_payload().unwrap()]
     }
 
     pub fn try_fcs_mut(&mut self) -> Option<&mut [u8]> {
-        Some(&mut self.mpdu.as_mut().buffer[self.mpdu_field_ranges.try_range_fcs()?])
+        Some(&mut self.mpdu.mpdu_buffer_mut()[self.mpdu_field_ranges.try_range_fcs()?])
     }
 
     pub fn fcs_mut(&mut self) -> &mut [u8] {
-        &mut self.mpdu.as_mut().buffer[self.mpdu_field_ranges.try_range_fcs().unwrap()]
+        &mut self.mpdu.mpdu_buffer_mut()[self.mpdu_field_ranges.try_range_fcs().unwrap()]
     }
 }
 

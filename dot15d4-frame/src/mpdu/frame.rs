@@ -162,6 +162,38 @@ pub trait MpduBytes {
     }
 }
 
+/// Write access to the bytes of an MPDU being built or edited.
+///
+/// [`MpduParser`]'s setters write through this trait, so a frame is built
+/// alike in an [`MpduFrame`] in a radio buffer and in an [`MpduSliceMut`] over
+/// a plain byte slice.
+pub trait MpduBytesMut: MpduBytes {
+    /// The bytes that hold the MPDU, which may begin with headroom.
+    fn mpdu_buffer_mut(&mut self) -> &mut [u8];
+
+    /// Provides mutable access to the [`FrameControl`] field.
+    fn mpdu_frame_control_mut(&mut self) -> FrameControl<&mut [u8]> {
+        let offset = self.mpdu_offset() as usize;
+        FrameControl::new_unchecked(&mut self.mpdu_buffer_mut()[offset..offset + 2])
+    }
+
+    /// Writes the sequence number field.
+    ///
+    /// Returns an error if the sequence number is suppressed, or if the MPDU
+    /// is too short to hold it.
+    fn mpdu_try_set_sequence_number(&mut self, seq_nr: u8) -> Result<(), ()> {
+        const OFFSET_SEQ_NR: u16 = 2;
+        if self.mpdu_frame_control().sequence_number_suppression()
+            || self.mpdu_length_wo_fcs() <= OFFSET_SEQ_NR
+        {
+            return Err(());
+        }
+        let offset = self.mpdu_offset() as usize + OFFSET_SEQ_NR as usize;
+        self.mpdu_buffer_mut()[offset] = seq_nr;
+        Ok(())
+    }
+}
+
 impl MpduBytes for MpduFrame {
     fn mpdu_buffer(&self) -> &[u8] {
         &self.buffer
@@ -201,6 +233,18 @@ impl MpduBytes for &mut MpduFrame {
 
     fn mpdu_length_wo_fcs(&self) -> u16 {
         self.length_wo_fcs.get()
+    }
+}
+
+impl MpduBytesMut for MpduFrame {
+    fn mpdu_buffer_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+}
+
+impl MpduBytesMut for &mut MpduFrame {
+    fn mpdu_buffer_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer
     }
 }
 
@@ -281,6 +325,110 @@ impl MpduBytes for MpduSlice<'_> {
 
     fn mpdu_length_wo_fcs(&self) -> u16 {
         self.length_wo_fcs.get()
+    }
+}
+
+/// An MPDU being built in a byte slice, from its first byte.
+///
+/// Made by [`MpduRepr::into_slice_writer()`], which builds frames without a
+/// buffer allocator, for example in a test or a tool, or in firmware that
+/// sends from a buffer of its own:
+///
+/// ```
+/// # use dot15d4_driver::radio::frame::{
+/// #     Address, AddressingMode, AddressingRepr, FrameType, FrameVersion, PanId, ShortAddress,
+/// # };
+/// # use dot15d4_frame::repr::{MpduRepr, SeqNrRepr};
+/// let repr = MpduRepr::new()
+///     .with_frame_control(SeqNrRepr::Yes)
+///     .with_addressing(AddressingRepr::new_legacy_addressing(
+///         AddressingMode::Short,
+///         AddressingMode::Short,
+///         true,
+///     ))
+///     .without_security()
+///     .without_ies();
+/// let mut psdu = [0u8; 12];
+/// let mut writer = repr
+///     .into_slice_writer(FrameVersion::Ieee802154_2006, FrameType::Data, 1, 2, &mut psdu)
+///     .unwrap();
+/// writer.set_sequence_number(1);
+/// let mut addressing = writer.addressing_fields_mut();
+/// addressing.dst_pan_id_mut().set(&PanId::new_owned([0xcd, 0xab]));
+/// addressing
+///     .dst_address_mut()
+///     .set(&Address::Short(ShortAddress::new_owned([0xff, 0xff])));
+/// addressing
+///     .src_address_mut()
+///     .set(&Address::Short(ShortAddress::new_owned([0x01, 0x00])));
+/// writer.frame_payload_mut()[0] = 0x2a;
+/// // The FCS's two bytes are left to the radio.
+/// assert_eq!(
+///     psdu,
+///     [0x41, 0x98, 0x01, 0xcd, 0xab, 0xff, 0xff, 0x01, 0x00, 0x2a, 0x00, 0x00]
+/// );
+/// ```
+///
+/// [`MpduRepr::into_slice_writer()`]: crate::repr::MpduRepr::into_slice_writer
+#[derive(Debug, PartialEq, Eq)]
+pub struct MpduSliceMut<'a> {
+    bytes: &'a mut [u8],
+    length_wo_fcs: NonZero<u16>,
+    fcs_length: u8,
+}
+
+impl<'a> MpduSliceMut<'a> {
+    /// Wraps a buffer for an MPDU of `length_wo_fcs` bytes and an FCS of
+    /// `fcs_length` bytes.
+    ///
+    /// Returns [`None`] if the buffer can't hold them, or if the MPDU is too
+    /// short to hold a frame control field.
+    pub(crate) fn new(
+        bytes: &'a mut [u8],
+        length_wo_fcs: NonZero<u16>,
+        fcs_length: u8,
+    ) -> Option<Self> {
+        const FRAME_CONTROL_LEN: u16 = 2;
+        if length_wo_fcs.get() < FRAME_CONTROL_LEN
+            || bytes.len() < length_wo_fcs.get() as usize + fcs_length as usize
+        {
+            return None;
+        }
+        Some(Self {
+            bytes,
+            length_wo_fcs,
+            fcs_length,
+        })
+    }
+
+    /// The length of the FCS that follows the MPDU.
+    pub fn fcs_length(&self) -> u8 {
+        self.fcs_length
+    }
+
+    /// The length of the PSDU: the MPDU and its FCS.
+    pub fn psdu_length(&self) -> usize {
+        self.length_wo_fcs.get() as usize + self.fcs_length as usize
+    }
+}
+
+impl MpduBytes for MpduSliceMut<'_> {
+    fn mpdu_buffer(&self) -> &[u8] {
+        self.bytes
+    }
+
+    fn mpdu_offset(&self) -> u8 {
+        0
+    }
+
+    fn mpdu_length_wo_fcs(&self) -> u16 {
+        self.length_wo_fcs.get()
+    }
+}
+
+impl MpduBytesMut for MpduSliceMut<'_> {
+    fn mpdu_buffer_mut(&mut self) -> &mut [u8] {
+        self.bytes
     }
 }
 
